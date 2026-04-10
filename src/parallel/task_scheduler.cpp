@@ -222,6 +222,7 @@ ProducerToken::ProducerToken(TaskScheduler &scheduler, unique_ptr<QueueProducerT
 }
 
 ProducerToken::~ProducerToken() {
+	scheduler.UnregisterProducer(*this);
 }
 
 TaskScheduler::TaskScheduler(DatabaseInstance &db)
@@ -252,7 +253,62 @@ TaskScheduler &TaskScheduler::GetScheduler(DatabaseInstance &db) {
 
 unique_ptr<ProducerToken> TaskScheduler::CreateProducer() {
 	auto token = make_uniq<QueueProducerToken>(*queue);
-	return make_uniq<ProducerToken>(*this, std::move(token));
+	auto producer = make_uniq<ProducerToken>(*this, std::move(token));
+	RegisterProducer(*producer);
+	return producer;
+}
+
+void TaskScheduler::SetProducerPriority(ProducerToken &producer, int64_t priority) {
+	lock_guard<mutex> lock(producer_priority_lock);
+	auto entry = producer_priorities.find(&producer);
+	if (entry != producer_priorities.end()) {
+		entry->second = priority;
+	}
+}
+
+void TaskScheduler::AdjustProducerPriority(ProducerToken &producer, int64_t delta) {
+	lock_guard<mutex> lock(producer_priority_lock);
+	auto entry = producer_priorities.find(&producer);
+	if (entry != producer_priorities.end()) {
+		entry->second += delta;
+	}
+}
+
+void TaskScheduler::SetProducerQuerySize(ProducerToken &producer, idx_t query_size) {
+	// smaller queries should get higher dequeue preference
+	auto max_int64 = NumericCast<idx_t>(NumericLimits<int64_t>::Maximum());
+	auto clamped_query_size = MinValue<idx_t>(query_size, max_int64);
+	auto priority = -NumericCast<int64_t>(clamped_query_size);
+	SetProducerPriority(producer, priority);
+}
+
+void TaskScheduler::RegisterProducer(ProducerToken &producer) {
+	lock_guard<mutex> lock(producer_priority_lock);
+	producer_priorities[&producer] = 0;
+}
+
+void TaskScheduler::UnregisterProducer(ProducerToken &producer) {
+	lock_guard<mutex> lock(producer_priority_lock);
+	producer_priorities.erase(&producer);
+}
+
+bool TaskScheduler::TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task) {
+	lock_guard<mutex> lock(producer_priority_lock);
+	if (producer_priorities.empty()) {
+		return false;
+	}
+	ProducerToken *selected_producer = nullptr;
+	int64_t highest_priority = NumericLimits<int64_t>::Minimum();
+	for (auto &entry : producer_priorities) {
+		if (!selected_producer || entry.second > highest_priority) {
+			selected_producer = entry.first;
+			highest_priority = entry.second;
+		}
+	}
+	if (!selected_producer) {
+		return false;
+	}
+	return queue->DequeueFromProducer(*selected_producer, task);
 }
 
 void TaskScheduler::ScheduleTask(ProducerToken &token, shared_ptr<Task> task) {
@@ -299,7 +355,11 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 				}
 			}
 		}
-		if (queue->Dequeue(task)) {
+		auto found_task = TryDequeuePrioritizedProducerTask(task);
+		if (!found_task) {
+			found_task = queue->Dequeue(task);
+		}
+		if (found_task) {
 			auto process_mode = TaskExecutionMode::PROCESS_ALL;
 			if (Settings::Get<SchedulerProcessPartialSetting>(config)) {
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
@@ -343,7 +403,11 @@ idx_t TaskScheduler::ExecuteTasks(atomic<bool> *marker, idx_t max_tasks) {
 	// loop until the marker is set to false
 	while (*marker && completed_tasks < max_tasks) {
 		shared_ptr<Task> task;
-		if (!queue->Dequeue(task)) {
+		auto found_task = TryDequeuePrioritizedProducerTask(task);
+		if (!found_task) {
+			found_task = queue->Dequeue(task);
+		}
+		if (!found_task) {
 			return completed_tasks;
 		}
 		auto execute_result = task->Execute(TaskExecutionMode::PROCESS_ALL);
@@ -373,7 +437,11 @@ void TaskScheduler::ExecuteTasks(idx_t max_tasks) {
 	shared_ptr<Task> task;
 	for (idx_t i = 0; i < max_tasks; i++) {
 		queue->semaphore.wait(TASK_TIMEOUT_USECS);
-		if (!queue->Dequeue(task)) {
+		auto found_task = TryDequeuePrioritizedProducerTask(task);
+		if (!found_task) {
+			found_task = queue->Dequeue(task);
+		}
+		if (!found_task) {
 			return;
 		}
 		try {

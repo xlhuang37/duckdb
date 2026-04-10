@@ -394,6 +394,7 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		this->profiler = ClientData::Get(context).profiler;
 		profiler->Initialize(plan);
 		this->producer = scheduler.CreateProducer();
+		scheduler.SetProducerQuerySize(*this->producer, plan.estimated_cardinality);
 
 		// build and ready the pipelines
 		PipelineBuildState state;

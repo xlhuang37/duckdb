@@ -13,6 +13,7 @@
 #include "duckdb/common/mutex.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/parallel/task.hpp"
+#include <unordered_map>
 
 namespace duckdb {
 
@@ -46,6 +47,12 @@ public:
 	DUCKDB_API static TaskScheduler &GetScheduler(DatabaseInstance &db);
 
 	unique_ptr<ProducerToken> CreateProducer();
+	//! Sets an explicit producer priority. Higher values are dequeued first.
+	void SetProducerPriority(ProducerToken &producer, int64_t priority);
+	//! Adjusts the producer priority by the provided delta.
+	void AdjustProducerPriority(ProducerToken &producer, int64_t delta);
+	//! Sets producer priority based on query size/cardinality (smaller queries get higher priority).
+	void SetProducerQuerySize(ProducerToken &producer, idx_t query_size);
 	//! Schedule a task to be executed by the task scheduler
 	void ScheduleTask(ProducerToken &producer, shared_ptr<Task> task);
 	void ScheduleTasks(ProducerToken &producer, vector<shared_ptr<Task>> &tasks);
@@ -90,7 +97,12 @@ public:
 	static idx_t GetEstimatedCPUId();
 
 private:
+	void RegisterProducer(ProducerToken &producer);
+	void UnregisterProducer(ProducerToken &producer);
+	bool TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task);
 	void RelaunchThreadsInternal(int32_t n, bool destroy);
+
+	friend struct ProducerToken;
 
 private:
 	DatabaseInstance &db;
@@ -102,6 +114,9 @@ private:
 	vector<unique_ptr<SchedulerThread>> threads;
 	//! Markers used by the various threads, if the markers are set to "false" the thread execution is stopped
 	vector<unique_ptr<atomic<bool>>> markers;
+	//! Per-producer dynamic priorities (higher value = higher dequeue priority)
+	mutex producer_priority_lock;
+	unordered_map<ProducerToken *, int64_t> producer_priorities;
 	//! The threshold after which to flush the allocator after completing a task
 	atomic<idx_t> allocator_flush_threshold;
 	//! Whether allocator background threads are enabled

@@ -1653,6 +1653,17 @@ struct ZstdMinStringLengthSetting {
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };
 
+struct QueryPrioritySetting {
+	using RETURN_TYPE = int64_t;
+	static constexpr const char *Name = "query_priority";
+	static constexpr const char *Description =
+	    "Sets the priority for the current query/session. Higher values are prioritized first by the scheduler.";
+	static constexpr const char *InputType = "BIGINT";
+	static constexpr const char *DefaultValue = "-9223372036854775808";
+	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
+	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
+};
+
 struct GeneratedSettingInfo {
 	static constexpr idx_t MaxSettingIndex = NEXT_SETTING_INDEX();
 };

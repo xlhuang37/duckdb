@@ -262,7 +262,7 @@ void TaskScheduler::SetProducerPriority(ProducerToken &producer, int64_t priorit
 	lock_guard<mutex> lock(producer_priority_lock);
 	auto entry = producer_priorities.find(&producer);
 	if (entry != producer_priorities.end()) {
-		entry->second = priority;
+		entry->second.base_priority = priority;
 	}
 }
 
@@ -270,7 +270,7 @@ void TaskScheduler::AdjustProducerPriority(ProducerToken &producer, int64_t delt
 	lock_guard<mutex> lock(producer_priority_lock);
 	auto entry = producer_priorities.find(&producer);
 	if (entry != producer_priorities.end()) {
-		entry->second += delta;
+		entry->second.base_priority += delta;
 	}
 }
 
@@ -282,9 +282,23 @@ void TaskScheduler::SetProducerQuerySize(ProducerToken &producer, idx_t query_si
 	SetProducerPriority(producer, priority);
 }
 
+void TaskScheduler::SetSchedulingPolicy(TaskSchedulingPolicy policy) {
+	lock_guard<mutex> lock(producer_priority_lock);
+	scheduling_policy = policy;
+}
+
+void TaskScheduler::SetProducerProgress(ProducerToken &producer, double progress) {
+	lock_guard<mutex> lock(producer_priority_lock);
+	auto entry = producer_priorities.find(&producer);
+	if (entry == producer_priorities.end()) {
+		return;
+	}
+	entry->second.progress = MaxValue<double>(0, MinValue<double>(1, progress));
+}
+
 void TaskScheduler::RegisterProducer(ProducerToken &producer) {
 	lock_guard<mutex> lock(producer_priority_lock);
-	producer_priorities[&producer] = 0;
+	producer_priorities[&producer] = ProducerSchedulingState();
 }
 
 void TaskScheduler::UnregisterProducer(ProducerToken &producer) {
@@ -298,17 +312,74 @@ bool TaskScheduler::TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task) {
 		return false;
 	}
 	ProducerToken *selected_producer = nullptr;
-	int64_t highest_priority = NumericLimits<int64_t>::Minimum();
+	double selected_score = 0;
+	bool first_entry = true;
 	for (auto &entry : producer_priorities) {
-		if (!selected_producer || entry.second > highest_priority) {
+		double score = 0;
+		switch (scheduling_policy) {
+		case TaskSchedulingPolicy::STATIC_PRIORITY:
+			score = UnsafeNumericCast<double>(entry.second.base_priority);
+			break;
+		case TaskSchedulingPolicy::SRPT: {
+			auto pending = queue->GetTaskCountForProducer(*entry.first);
+			auto remaining_tasks = pending + entry.second.in_flight_tasks;
+			double avg_runtime = 1;
+			if (entry.second.completed_tasks > 0) {
+				avg_runtime = UnsafeNumericCast<double>(entry.second.runtime_micros) /
+				              UnsafeNumericCast<double>(entry.second.completed_tasks);
+			}
+			auto progress_factor = MaxValue<double>(0, 1.0 - entry.second.progress);
+			auto remaining_cost = avg_runtime * UnsafeNumericCast<double>(remaining_tasks) * progress_factor;
+			score = UnsafeNumericCast<double>(entry.second.base_priority) - remaining_cost;
+			break;
+		}
+		case TaskSchedulingPolicy::SFQ:
+			// Smaller service received should dequeue first. We invert the sign to keep "higher score wins".
+			score = UnsafeNumericCast<double>(entry.second.base_priority) -
+			        UnsafeNumericCast<double>(entry.second.runtime_micros);
+			break;
+		}
+		if (first_entry || score > selected_score) {
 			selected_producer = entry.first;
-			highest_priority = entry.second;
+			selected_score = score;
+			first_entry = false;
 		}
 	}
 	if (!selected_producer) {
 		return false;
 	}
-	return queue->DequeueFromProducer(*selected_producer, task);
+	auto success = queue->DequeueFromProducer(*selected_producer, task);
+	if (success) {
+		producer_priorities[selected_producer].in_flight_tasks++;
+	}
+	return success;
+}
+
+void TaskScheduler::RecordTaskDequeued(Task &task) {
+	if (!task.token) {
+		return;
+	}
+	lock_guard<mutex> lock(producer_priority_lock);
+	auto entry = producer_priorities.find(task.token.get());
+	if (entry != producer_priorities.end()) {
+		entry->second.in_flight_tasks++;
+	}
+}
+
+void TaskScheduler::RecordTaskCompletion(Task &task, uint64_t runtime_micros) {
+	if (!task.token) {
+		return;
+	}
+	lock_guard<mutex> lock(producer_priority_lock);
+	auto entry = producer_priorities.find(task.token.get());
+	if (entry == producer_priorities.end()) {
+		return;
+	}
+	if (entry->second.in_flight_tasks > 0) {
+		entry->second.in_flight_tasks--;
+	}
+	entry->second.completed_tasks++;
+	entry->second.runtime_micros += runtime_micros;
 }
 
 void TaskScheduler::ScheduleTask(ProducerToken &token, shared_ptr<Task> task) {
@@ -358,13 +429,22 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 		auto found_task = TryDequeuePrioritizedProducerTask(task);
 		if (!found_task) {
 			found_task = queue->Dequeue(task);
+			if (found_task) {
+				RecordTaskDequeued(*task);
+			}
 		}
 		if (found_task) {
+			auto start_time = std::chrono::high_resolution_clock::now();
 			auto process_mode = TaskExecutionMode::PROCESS_ALL;
 			if (Settings::Get<SchedulerProcessPartialSetting>(config)) {
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
 			}
 			auto execute_result = task->Execute(process_mode);
+			auto end_time = std::chrono::high_resolution_clock::now();
+			auto runtime_micros =
+			    NumericCast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time)
+			                              .count());
+			RecordTaskCompletion(*task, runtime_micros);
 
 			switch (execute_result) {
 			case TaskExecutionResult::TASK_FINISHED:
@@ -406,11 +486,19 @@ idx_t TaskScheduler::ExecuteTasks(atomic<bool> *marker, idx_t max_tasks) {
 		auto found_task = TryDequeuePrioritizedProducerTask(task);
 		if (!found_task) {
 			found_task = queue->Dequeue(task);
+			if (found_task) {
+				RecordTaskDequeued(*task);
+			}
 		}
 		if (!found_task) {
 			return completed_tasks;
 		}
+		auto start_time = std::chrono::high_resolution_clock::now();
 		auto execute_result = task->Execute(TaskExecutionMode::PROCESS_ALL);
+		auto end_time = std::chrono::high_resolution_clock::now();
+		auto runtime_micros =
+		    NumericCast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time).count());
+		RecordTaskCompletion(*task, runtime_micros);
 
 		switch (execute_result) {
 		case TaskExecutionResult::TASK_FINISHED:
@@ -440,12 +528,21 @@ void TaskScheduler::ExecuteTasks(idx_t max_tasks) {
 		auto found_task = TryDequeuePrioritizedProducerTask(task);
 		if (!found_task) {
 			found_task = queue->Dequeue(task);
+			if (found_task) {
+				RecordTaskDequeued(*task);
+			}
 		}
 		if (!found_task) {
 			return;
 		}
 		try {
+			auto start_time = std::chrono::high_resolution_clock::now();
 			auto execute_result = task->Execute(TaskExecutionMode::PROCESS_ALL);
+			auto end_time = std::chrono::high_resolution_clock::now();
+			auto runtime_micros =
+			    NumericCast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(end_time - start_time)
+			                              .count());
+			RecordTaskCompletion(*task, runtime_micros);
 			switch (execute_result) {
 			case TaskExecutionResult::TASK_FINISHED:
 			case TaskExecutionResult::TASK_ERROR:

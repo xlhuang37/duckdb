@@ -25,6 +25,8 @@ class TaskScheduler;
 
 struct SchedulerThread;
 
+enum class TaskSchedulingPolicy : uint8_t { STATIC_PRIORITY = 0, SRPT = 1, SFQ = 2 };
+
 struct ProducerToken {
 	ProducerToken(TaskScheduler &scheduler, unique_ptr<QueueProducerToken> token);
 	~ProducerToken();
@@ -53,6 +55,10 @@ public:
 	void AdjustProducerPriority(ProducerToken &producer, int64_t delta);
 	//! Sets producer priority based on query size/cardinality (smaller queries get higher priority).
 	void SetProducerQuerySize(ProducerToken &producer, idx_t query_size);
+	//! Sets the scheduler policy used to select the next producer when tasks are available.
+	void SetSchedulingPolicy(TaskSchedulingPolicy policy);
+	//! Sets producer progress in the range [0, 1]. Used by dynamic policies to estimate remaining work.
+	void SetProducerProgress(ProducerToken &producer, double progress);
 	//! Schedule a task to be executed by the task scheduler
 	void ScheduleTask(ProducerToken &producer, shared_ptr<Task> task);
 	void ScheduleTasks(ProducerToken &producer, vector<shared_ptr<Task>> &tasks);
@@ -97,9 +103,19 @@ public:
 	static idx_t GetEstimatedCPUId();
 
 private:
+	struct ProducerSchedulingState {
+		int64_t base_priority = 0;
+		idx_t completed_tasks = 0;
+		idx_t in_flight_tasks = 0;
+		uint64_t runtime_micros = 0;
+		double progress = 0;
+	};
+
 	void RegisterProducer(ProducerToken &producer);
 	void UnregisterProducer(ProducerToken &producer);
 	bool TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task);
+	void RecordTaskDequeued(Task &task);
+	void RecordTaskCompletion(Task &task, uint64_t runtime_micros);
 	void RelaunchThreadsInternal(int32_t n, bool destroy);
 
 	friend struct ProducerToken;
@@ -116,7 +132,8 @@ private:
 	vector<unique_ptr<atomic<bool>>> markers;
 	//! Per-producer dynamic priorities (higher value = higher dequeue priority)
 	mutex producer_priority_lock;
-	unordered_map<ProducerToken *, int64_t> producer_priorities;
+	unordered_map<ProducerToken *, ProducerSchedulingState> producer_priorities;
+	TaskSchedulingPolicy scheduling_policy = TaskSchedulingPolicy::STATIC_PRIORITY;
 	//! The threshold after which to flush the allocator after completing a task
 	atomic<idx_t> allocator_flush_threshold;
 	//! Whether allocator background threads are enabled

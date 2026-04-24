@@ -10,6 +10,7 @@ This folder contains a small online benchmark harness to evaluate scheduler beha
 - Runs requests concurrently with a configurable worker pool.
 - Records per-query latency and aggregates throughput and percentile latency metrics.
 - Sets `scheduler_policy` on each worker connection so policies can be swapped from the benchmark CLI.
+- Executes workload queries with `-readonly` to avoid cross-process write locks when multiple worker subprocesses hit the same DB file.
 
 ## Usage
 

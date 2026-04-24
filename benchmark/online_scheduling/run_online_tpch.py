@@ -36,8 +36,12 @@ class BenchmarkSummary:
     sample_failure: str
 
 
-def run_duckdb_sql(duckdb_binary: str, db_path: str, sql: str) -> None:
-    subprocess.run([duckdb_binary, db_path, "-c", sql], check=True, capture_output=True, text=True)
+def run_duckdb_sql(duckdb_binary: str, db_path: str, sql: str, readonly: bool = False) -> None:
+    cmd = [duckdb_binary]
+    if readonly:
+        cmd.append("-readonly")
+    cmd.extend([db_path, "-c", sql])
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
 def get_local_tpch_extension_path(duckdb_binary: str) -> Optional[str]:
@@ -89,9 +93,15 @@ def worker_loop(
         query_id, query_name, query = item
         start = time.perf_counter()
         try:
-            run_duckdb_sql(duckdb_binary, db_path, f"SET scheduler_policy='{scheduler_policy}'; {query}")
+            run_duckdb_sql(duckdb_binary, db_path, f"SET scheduler_policy='{scheduler_policy}'; {query}", readonly=True)
             latency = time.perf_counter() - start
             result = QueryResult(query_id=query_id, query_name=query_name, latency_seconds=latency, success=True)
+        except subprocess.CalledProcessError as ex:
+            error_message = ex.stderr.strip() if ex.stderr else str(ex)
+            latency = time.perf_counter() - start
+            result = QueryResult(
+                query_id=query_id, query_name=query_name, latency_seconds=latency, success=False, error=error_message
+            )
         except Exception as ex:
             latency = time.perf_counter() - start
             result = QueryResult(

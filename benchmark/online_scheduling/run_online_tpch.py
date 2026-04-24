@@ -10,7 +10,7 @@ from pathlib import Path
 
 import duckdb
 
-SUPPORTED_POLICIES = ("static_priority", "srpt", "las", "sfq")
+SUPPORTED_POLICIES = ("no_priority", "srpt", "las", "sfq")
 
 
 @dataclass
@@ -187,7 +187,7 @@ def main() -> None:
     parser.add_argument("--duration-seconds", type=int, default=60, help="Benchmark duration")
     parser.add_argument(
         "--scheduler-policy",
-        default="static_priority",
+        default="no_priority",
         choices=SUPPORTED_POLICIES,
         help="Scheduler policy to run (ignored when --compare-policies is set)",
     )

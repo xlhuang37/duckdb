@@ -1668,9 +1668,9 @@ struct SchedulerPolicySetting {
 	using RETURN_TYPE = string;
 	static constexpr const char *Name = "scheduler_policy";
 	static constexpr const char *Description =
-	    "Sets task scheduling policy. Options: 'static_priority', 'srpt', 'las', 'sfq'.";
+	    "Sets task scheduling policy. Options: 'no_priority', 'srpt', 'las', 'sfq'.";
 	static constexpr const char *InputType = "VARCHAR";
-	static constexpr const char *DefaultValue = "static_priority";
+	static constexpr const char *DefaultValue = "no_priority";
 	static constexpr SettingScopeTarget Scope = SettingScopeTarget::LOCAL_DEFAULT;
 	static constexpr idx_t SettingIndex = NEXT_SETTING_INDEX();
 };

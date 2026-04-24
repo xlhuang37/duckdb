@@ -258,21 +258,6 @@ unique_ptr<ProducerToken> TaskScheduler::CreateProducer() {
 	return producer;
 }
 
-void TaskScheduler::SetProducerPriority(ProducerToken &producer, int64_t priority) {
-	(void)producer;
-	(void)priority;
-}
-
-void TaskScheduler::AdjustProducerPriority(ProducerToken &producer, int64_t delta) {
-	(void)producer;
-	(void)delta;
-}
-
-void TaskScheduler::SetProducerQuerySize(ProducerToken &producer, idx_t query_size) {
-	(void)producer;
-	(void)query_size;
-}
-
 void TaskScheduler::SetSchedulingPolicy(TaskSchedulingPolicy policy) {
 	lock_guard<mutex> lock(producer_priority_lock);
 	scheduling_policy = policy;
@@ -300,7 +285,7 @@ void TaskScheduler::UnregisterProducer(ProducerToken &producer) {
 }
 
 bool TaskScheduler::TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task) {
-	if (scheduling_policy == TaskSchedulingPolicy::STATIC_PRIORITY) {
+	if (scheduling_policy == TaskSchedulingPolicy::NO_PRIORITY) {
 		// No-priority mode: use the queue's default dequeue behavior.
 		return false;
 	}
@@ -314,7 +299,7 @@ bool TaskScheduler::TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task) {
 	for (auto &entry : producer_priorities) {
 		double score = 0;
 		switch (scheduling_policy) {
-		case TaskSchedulingPolicy::STATIC_PRIORITY:
+		case TaskSchedulingPolicy::NO_PRIORITY:
 			continue;
 		case TaskSchedulingPolicy::SRPT: {
 			auto pending = queue->GetTaskCountForProducer(*entry.first);

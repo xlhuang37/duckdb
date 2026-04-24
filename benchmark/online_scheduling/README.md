@@ -32,10 +32,10 @@ python3 benchmark/online_scheduling/run_online_tpch.py \
   --workers 4 \
   --arrival-rate 0.5 \
   --duration-seconds 60 \
-  --compare-policies static_priority srpt las sfq
+  --compare-policies no_priority srpt las sfq
 ```
 
 ## Notes
 
 - This script uses the Python DuckDB package and runs independently of the C++ test harness.
-- Available policies: `static_priority`, `srpt`, `las`, `sfq`.
+- Available policies: `no_priority`, `srpt`, `las`, `sfq`.

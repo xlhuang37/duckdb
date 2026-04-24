@@ -25,7 +25,7 @@ class TaskScheduler;
 
 struct SchedulerThread;
 
-enum class TaskSchedulingPolicy : uint8_t { STATIC_PRIORITY = 0, SRPT = 1, LAS = 2, SFQ = 3 };
+enum class TaskSchedulingPolicy : uint8_t { NO_PRIORITY = 0, SRPT = 1, LAS = 2, SFQ = 3 };
 
 struct ProducerToken {
 	ProducerToken(TaskScheduler &scheduler, unique_ptr<QueueProducerToken> token);
@@ -49,12 +49,6 @@ public:
 	DUCKDB_API static TaskScheduler &GetScheduler(DatabaseInstance &db);
 
 	unique_ptr<ProducerToken> CreateProducer();
-	//! Deprecated (no-op): retained for API compatibility.
-	void SetProducerPriority(ProducerToken &producer, int64_t priority);
-	//! Deprecated (no-op): retained for API compatibility.
-	void AdjustProducerPriority(ProducerToken &producer, int64_t delta);
-	//! Deprecated (no-op): retained for API compatibility.
-	void SetProducerQuerySize(ProducerToken &producer, idx_t query_size);
 	//! Sets the scheduler policy used to select the next producer when tasks are available.
 	void SetSchedulingPolicy(TaskSchedulingPolicy policy);
 	//! Sets producer progress in the range [0, 1]. Used by dynamic policies to estimate remaining work.
@@ -133,7 +127,7 @@ private:
 	//! Per-producer dynamic priorities (higher value = higher dequeue priority)
 	mutex producer_priority_lock;
 	unordered_map<ProducerToken *, ProducerSchedulingState> producer_priorities;
-	TaskSchedulingPolicy scheduling_policy = TaskSchedulingPolicy::STATIC_PRIORITY;
+	TaskSchedulingPolicy scheduling_policy = TaskSchedulingPolicy::NO_PRIORITY;
 	uint64_t sfq_runtime_frontier = 0;
 	//! The threshold after which to flush the allocator after completing a task
 	atomic<idx_t> allocator_flush_threshold;

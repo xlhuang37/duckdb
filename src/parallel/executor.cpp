@@ -396,14 +396,16 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		profiler->Initialize(plan);
 		this->producer = scheduler.CreateProducer();
 		auto scheduler_policy = StringUtil::Lower(Settings::Get<SchedulerPolicySetting>(context));
-		if (scheduler_policy == "srpt") {
+		if (scheduler_policy == "no_priority") {
+			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::NO_PRIORITY);
+		} else if (scheduler_policy == "srpt") {
 			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::SRPT);
 		} else if (scheduler_policy == "las") {
 			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::LAS);
 		} else if (scheduler_policy == "sfq") {
 			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::SFQ);
 		} else {
-			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::STATIC_PRIORITY);
+			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::NO_PRIORITY);
 		}
 
 		// build and ready the pipelines

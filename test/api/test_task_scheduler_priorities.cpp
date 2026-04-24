@@ -34,7 +34,9 @@ private:
 } // namespace
 
 TEST_CASE("Task scheduler SRPT policy prioritizes producers with lower estimated remaining work", "[api]") {
-	DuckDB db(nullptr);
+	DBConfig config;
+	config.options.maximum_threads = 1;
+	DuckDB db(nullptr, &config);
 	Connection con(db);
 	auto &scheduler = TaskScheduler::GetScheduler(*db.instance);
 	scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::SRPT);
@@ -58,7 +60,9 @@ TEST_CASE("Task scheduler SRPT policy prioritizes producers with lower estimated
 }
 
 TEST_CASE("Task scheduler SFQ policy favors producers with lower attained service", "[api]") {
-	DuckDB db(nullptr);
+	DBConfig config;
+	config.options.maximum_threads = 1;
+	DuckDB db(nullptr, &config);
 	Connection con(db);
 	auto &scheduler = TaskScheduler::GetScheduler(*db.instance);
 	scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::SFQ);

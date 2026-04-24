@@ -318,25 +318,24 @@ bool TaskScheduler::TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task) {
 		double score = 0;
 		switch (scheduling_policy) {
 		case TaskSchedulingPolicy::STATIC_PRIORITY:
-			score = UnsafeNumericCast<double>(entry.second.base_priority);
+			score = static_cast<double>(entry.second.base_priority);
 			break;
 		case TaskSchedulingPolicy::SRPT: {
 			auto pending = queue->GetTaskCountForProducer(*entry.first);
 			auto remaining_tasks = pending + entry.second.in_flight_tasks;
 			double avg_runtime = 1;
 			if (entry.second.completed_tasks > 0) {
-				avg_runtime = UnsafeNumericCast<double>(entry.second.runtime_micros) /
-				              UnsafeNumericCast<double>(entry.second.completed_tasks);
+				avg_runtime = static_cast<double>(entry.second.runtime_micros) /
+				              static_cast<double>(entry.second.completed_tasks);
 			}
 			auto progress_factor = MaxValue<double>(0, 1.0 - entry.second.progress);
-			auto remaining_cost = avg_runtime * UnsafeNumericCast<double>(remaining_tasks) * progress_factor;
-			score = UnsafeNumericCast<double>(entry.second.base_priority) - remaining_cost;
+			auto remaining_cost = avg_runtime * static_cast<double>(remaining_tasks) * progress_factor;
+			score = static_cast<double>(entry.second.base_priority) - remaining_cost;
 			break;
 		}
 		case TaskSchedulingPolicy::SFQ:
 			// Smaller service received should dequeue first. We invert the sign to keep "higher score wins".
-			score = UnsafeNumericCast<double>(entry.second.base_priority) -
-			        UnsafeNumericCast<double>(entry.second.runtime_micros);
+			score = static_cast<double>(entry.second.base_priority) - static_cast<double>(entry.second.runtime_micros);
 			break;
 		}
 		if (first_entry || score > selected_score) {

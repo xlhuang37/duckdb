@@ -42,3 +42,7 @@ python3 benchmark/online_scheduling/run_online_tpch.py \
 - This script runs every query through the provided DuckDB executable (`--duckdb-binary`), so it uses your compiled branch directly.
 - Available policies: `no_priority`, `srpt`, `las`, `sfq`.
 - `srpt`/`las`/`sfq` require a DuckDB binary that includes the `scheduler_policy` setting.
+- TPCH setup prefers a locally built extension at `<build_dir>/extension/tpch/tpch.duckdb_extension` and only falls back to
+  `INSTALL tpch` if it cannot find that file.
+- If your binary reports version `v0.0.1`, fetch git tags (or set `OVERRIDE_GIT_DESCRIBE`) before building; otherwise
+  extension auto-download URLs may not exist.

@@ -8,6 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 SUPPORTED_POLICIES = ("no_priority", "srpt", "las", "sfq")
 
@@ -39,8 +40,21 @@ def run_duckdb_sql(duckdb_binary: str, db_path: str, sql: str) -> None:
     subprocess.run([duckdb_binary, db_path, "-c", sql], check=True, capture_output=True, text=True)
 
 
+def get_local_tpch_extension_path(duckdb_binary: str) -> Optional[str]:
+    binary_path = Path(duckdb_binary).resolve()
+    build_dir = binary_path.parent
+    extension_path = build_dir / "extension" / "tpch" / "tpch.duckdb_extension"
+    if extension_path.exists():
+        return str(extension_path)
+    return None
+
+
 def setup_tpch_database(duckdb_binary: str, db_path: str, scale_factor: int) -> None:
-    setup_sql = f"INSTALL tpch; LOAD tpch; CALL dbgen(sf={scale_factor});"
+    local_tpch_extension = get_local_tpch_extension_path(duckdb_binary)
+    if local_tpch_extension:
+        setup_sql = f"LOAD '{local_tpch_extension}'; CALL dbgen(sf={scale_factor});"
+    else:
+        setup_sql = f"INSTALL tpch; LOAD tpch; CALL dbgen(sf={scale_factor});"
     run_duckdb_sql(duckdb_binary, db_path, setup_sql)
 
 

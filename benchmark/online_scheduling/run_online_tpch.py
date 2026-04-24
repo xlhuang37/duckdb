@@ -3,12 +3,11 @@ import argparse
 import queue
 import random
 import statistics
+import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-
-import duckdb
 
 SUPPORTED_POLICIES = ("no_priority", "srpt", "las", "sfq")
 
@@ -36,12 +35,13 @@ class BenchmarkSummary:
     sample_failure: str
 
 
-def setup_tpch_database(db_path: str, scale_factor: int) -> None:
-    con = duckdb.connect(db_path)
-    con.execute("INSTALL tpch")
-    con.execute("LOAD tpch")
-    con.execute(f"CALL dbgen(sf={scale_factor})")
-    con.close()
+def run_duckdb_sql(duckdb_binary: str, db_path: str, sql: str) -> None:
+    subprocess.run([duckdb_binary, db_path, "-c", sql], check=True, capture_output=True, text=True)
+
+
+def setup_tpch_database(duckdb_binary: str, db_path: str, scale_factor: int) -> None:
+    setup_sql = f"INSTALL tpch; LOAD tpch; CALL dbgen(sf={scale_factor});"
+    run_duckdb_sql(duckdb_binary, db_path, setup_sql)
 
 
 def load_tpch_queries_from_repo() -> list[tuple[str, str]]:
@@ -59,32 +59,14 @@ def load_tpch_queries_from_repo() -> list[tuple[str, str]]:
     return queries
 
 
-def has_scheduler_policy_setting(con: duckdb.DuckDBPyConnection) -> bool:
-    result = con.execute("SELECT count(*) FROM duckdb_settings() WHERE name='scheduler_policy'").fetchone()
-    return bool(result and result[0] > 0)
-
-
-def try_set_scheduler_policy(con: duckdb.DuckDBPyConnection, scheduler_policy: str) -> bool:
-    if not has_scheduler_policy_setting(con):
-        return False
-    con.execute(f"SET scheduler_policy='{scheduler_policy}'")
-    return True
-
-
 def worker_loop(
+    duckdb_binary: str,
     db_path: str,
     scheduler_policy: str,
     work_queue: "queue.Queue[tuple[int, str, str] | None]",
     results: list[QueryResult],
     results_lock: threading.Lock,
 ) -> None:
-    con = duckdb.connect(db_path)
-    policy_applied = try_set_scheduler_policy(con, scheduler_policy)
-    if scheduler_policy != "no_priority" and not policy_applied:
-        raise RuntimeError(
-            "This DuckDB build does not expose `scheduler_policy`. "
-            "Use your modified DuckDB build/package to benchmark srpt/las/sfq."
-        )
     while True:
         item = work_queue.get()
         if item is None:
@@ -93,7 +75,7 @@ def worker_loop(
         query_id, query_name, query = item
         start = time.perf_counter()
         try:
-            con.execute(query).fetchall()
+            run_duckdb_sql(duckdb_binary, db_path, f"SET scheduler_policy='{scheduler_policy}'; {query}")
             latency = time.perf_counter() - start
             result = QueryResult(query_id=query_id, query_name=query_name, latency_seconds=latency, success=True)
         except Exception as ex:
@@ -104,10 +86,10 @@ def worker_loop(
         with results_lock:
             results.append(result)
         work_queue.task_done()
-    con.close()
 
 
 def run_benchmark(
+    duckdb_binary: str,
     db_path: str,
     workers: int,
     arrival_rate: float,
@@ -122,7 +104,7 @@ def run_benchmark(
     worker_threads = []
     for _ in range(workers):
         thread = threading.Thread(
-            target=worker_loop, args=(db_path, scheduler_policy, work_queue, results, results_lock), daemon=True
+            target=worker_loop, args=(duckdb_binary, db_path, scheduler_policy, work_queue, results, results_lock), daemon=True
         )
         thread.start()
         worker_threads.append(thread)
@@ -197,6 +179,7 @@ def print_comparison(summaries: list[BenchmarkSummary]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run an online TPCH benchmark with Poisson arrivals.")
+    parser.add_argument("--duckdb-binary", required=True, help="Path to the compiled duckdb binary to run")
     parser.add_argument("--db-path", required=True, help="Path to DuckDB database file")
     parser.add_argument("--scale-factor", type=int, default=1, help="TPCH scale factor for dbgen")
     parser.add_argument("--workers", type=int, default=4, help="Number of worker threads")
@@ -217,28 +200,22 @@ def main() -> None:
     parser.add_argument("--skip-setup", action="store_true", help="Skip tpch INSTALL/LOAD/dbgen")
     args = parser.parse_args()
 
+    if not Path(args.duckdb_binary).exists():
+        raise FileNotFoundError(f"duckdb binary not found at {args.duckdb_binary}")
+
     if not args.skip_setup:
-        setup_tpch_database(args.db_path, args.scale_factor)
-    policy_check_con = duckdb.connect(args.db_path)
-    has_policy_setting = has_scheduler_policy_setting(policy_check_con)
-    policy_check_con.close()
+        setup_tpch_database(args.duckdb_binary, args.db_path, args.scale_factor)
 
     selected_policies = args.compare_policies if args.compare_policies else [args.scheduler_policy]
-    if not has_policy_setting:
-        non_default_policies = [policy for policy in selected_policies if policy != "no_priority"]
-        if non_default_policies:
-            raise RuntimeError(
-                "scheduler_policy is not available in this DuckDB build, but you requested "
-                f"{', '.join(non_default_policies)}. Build/install the modified DuckDB version first."
-            )
-        print("scheduler_policy is unavailable in this DuckDB build; continuing with no_priority.")
 
     queries = load_tpch_queries_from_repo()
     policies = selected_policies
     summaries: list[BenchmarkSummary] = []
     for policy in policies:
         print(f"\nRunning policy={policy}")
-        results = run_benchmark(args.db_path, args.workers, args.arrival_rate, args.duration_seconds, policy, queries)
+        results = run_benchmark(
+            args.duckdb_binary, args.db_path, args.workers, args.arrival_rate, args.duration_seconds, policy, queries
+        )
         summary = summarize_results(policy, args.duration_seconds, results)
         print_summary(summary)
         summaries.append(summary)

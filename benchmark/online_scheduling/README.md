@@ -15,6 +15,7 @@ This folder contains a small online benchmark harness to evaluate scheduler beha
 
 ```bash
 python3 benchmark/online_scheduling/run_online_tpch.py \
+  --duckdb-binary ./build/release/duckdb \
   --db-path /tmp/online_tpch.duckdb \
   --scale-factor 1 \
   --workers 4 \
@@ -27,6 +28,7 @@ Compare multiple policies in one run:
 
 ```bash
 python3 benchmark/online_scheduling/run_online_tpch.py \
+  --duckdb-binary ./build/release/duckdb \
   --db-path /tmp/online_tpch.duckdb \
   --scale-factor 1 \
   --workers 4 \
@@ -37,7 +39,6 @@ python3 benchmark/online_scheduling/run_online_tpch.py \
 
 ## Notes
 
-- This script uses the Python DuckDB package and runs independently of the C++ test harness.
+- This script runs every query through the provided DuckDB executable (`--duckdb-binary`), so it uses your compiled branch directly.
 - Available policies: `no_priority`, `srpt`, `las`, `sfq`.
-- `srpt`/`las`/`sfq` require a DuckDB build that includes the `scheduler_policy` setting (i.e., your modified build). If the
-  setting is unavailable, the script will only allow `no_priority` and explain why.
+- `srpt`/`las`/`sfq` require a DuckDB binary that includes the `scheduler_policy` setting.

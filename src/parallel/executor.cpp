@@ -22,7 +22,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <limits>
 
 namespace duckdb {
 
@@ -405,12 +404,6 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::SFQ);
 		} else {
 			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::STATIC_PRIORITY);
-		}
-		auto query_priority = Settings::Get<QueryPrioritySetting>(context);
-		if (query_priority == std::numeric_limits<int64_t>::min()) {
-			scheduler.SetProducerQuerySize(*this->producer, plan.estimated_cardinality);
-		} else {
-			scheduler.SetProducerPriority(*this->producer, query_priority);
 		}
 
 		// build and ready the pipelines

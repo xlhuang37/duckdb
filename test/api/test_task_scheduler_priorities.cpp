@@ -94,6 +94,7 @@ TEST_CASE("Task scheduler SFQ policy starts new producers at frontier service", 
 	scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::SFQ);
 
 	auto producer_a = scheduler.CreateProducer();
+	auto producer_b = scheduler.CreateProducer();
 	vector<int> execution_order;
 	mutex lock;
 	atomic<bool> marker(true);
@@ -104,10 +105,7 @@ TEST_CASE("Task scheduler SFQ policy starts new producers at frontier service", 
 
 	// New producers should start at the current frontier instead of zero service.
 	auto producer_new = scheduler.CreateProducer();
-	scheduler.SetProducerPriority(*producer_a, 0);
-	scheduler.SetProducerPriority(*producer_new, -1);
-
-	scheduler.ScheduleTask(*producer_a, make_shared_ptr<TrackingTask>(execution_order, lock, 2));
+	scheduler.ScheduleTask(*producer_b, make_shared_ptr<TrackingTask>(execution_order, lock, 2));
 	scheduler.ScheduleTask(*producer_new, make_shared_ptr<TrackingTask>(execution_order, lock, 3));
 	scheduler.ExecuteTasks(&marker, 1);
 

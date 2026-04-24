@@ -259,27 +259,18 @@ unique_ptr<ProducerToken> TaskScheduler::CreateProducer() {
 }
 
 void TaskScheduler::SetProducerPriority(ProducerToken &producer, int64_t priority) {
-	lock_guard<mutex> lock(producer_priority_lock);
-	auto entry = producer_priorities.find(&producer);
-	if (entry != producer_priorities.end()) {
-		entry->second.base_priority = priority;
-	}
+	(void)producer;
+	(void)priority;
 }
 
 void TaskScheduler::AdjustProducerPriority(ProducerToken &producer, int64_t delta) {
-	lock_guard<mutex> lock(producer_priority_lock);
-	auto entry = producer_priorities.find(&producer);
-	if (entry != producer_priorities.end()) {
-		entry->second.base_priority += delta;
-	}
+	(void)producer;
+	(void)delta;
 }
 
 void TaskScheduler::SetProducerQuerySize(ProducerToken &producer, idx_t query_size) {
-	// smaller queries should get higher dequeue preference
-	auto max_int64 = NumericCast<idx_t>(NumericLimits<int64_t>::Maximum());
-	auto clamped_query_size = MinValue<idx_t>(query_size, max_int64);
-	auto priority = -NumericCast<int64_t>(clamped_query_size);
-	SetProducerPriority(producer, priority);
+	(void)producer;
+	(void)query_size;
 }
 
 void TaskScheduler::SetSchedulingPolicy(TaskSchedulingPolicy policy) {
@@ -309,6 +300,10 @@ void TaskScheduler::UnregisterProducer(ProducerToken &producer) {
 }
 
 bool TaskScheduler::TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task) {
+	if (scheduling_policy == TaskSchedulingPolicy::STATIC_PRIORITY) {
+		// No-priority mode: use the queue's default dequeue behavior.
+		return false;
+	}
 	lock_guard<mutex> lock(producer_priority_lock);
 	if (producer_priorities.empty()) {
 		return false;
@@ -320,8 +315,7 @@ bool TaskScheduler::TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task) {
 		double score = 0;
 		switch (scheduling_policy) {
 		case TaskSchedulingPolicy::STATIC_PRIORITY:
-			score = static_cast<double>(entry.second.base_priority);
-			break;
+			continue;
 		case TaskSchedulingPolicy::SRPT: {
 			auto pending = queue->GetTaskCountForProducer(*entry.first);
 			auto remaining_tasks = pending + entry.second.in_flight_tasks;
@@ -332,17 +326,16 @@ bool TaskScheduler::TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task) {
 			}
 			auto progress_factor = MaxValue<double>(0, 1.0 - entry.second.progress);
 			auto remaining_cost = avg_runtime * static_cast<double>(remaining_tasks) * progress_factor;
-			score = static_cast<double>(entry.second.base_priority) - remaining_cost;
+			score = -remaining_cost;
 			break;
 		}
 		case TaskSchedulingPolicy::LAS:
 			// Smaller service received should dequeue first. We invert the sign to keep "higher score wins".
-			score = static_cast<double>(entry.second.base_priority) - static_cast<double>(entry.second.runtime_micros);
+			score = -static_cast<double>(entry.second.runtime_micros);
 			break;
 		case TaskSchedulingPolicy::SFQ:
 			// SFQ: flows start at the current frontier instead of zero service to avoid always favoring new producers.
-			score = static_cast<double>(entry.second.base_priority) -
-			        static_cast<double>(entry.second.virtual_runtime_micros);
+			score = -static_cast<double>(entry.second.virtual_runtime_micros);
 			break;
 		}
 		if (first_entry || score > selected_score) {

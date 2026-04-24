@@ -49,11 +49,11 @@ public:
 	DUCKDB_API static TaskScheduler &GetScheduler(DatabaseInstance &db);
 
 	unique_ptr<ProducerToken> CreateProducer();
-	//! Sets an explicit producer priority. Higher values are dequeued first.
+	//! Deprecated (no-op): retained for API compatibility.
 	void SetProducerPriority(ProducerToken &producer, int64_t priority);
-	//! Adjusts the producer priority by the provided delta.
+	//! Deprecated (no-op): retained for API compatibility.
 	void AdjustProducerPriority(ProducerToken &producer, int64_t delta);
-	//! Sets producer priority based on query size/cardinality (smaller queries get higher priority).
+	//! Deprecated (no-op): retained for API compatibility.
 	void SetProducerQuerySize(ProducerToken &producer, idx_t query_size);
 	//! Sets the scheduler policy used to select the next producer when tasks are available.
 	void SetSchedulingPolicy(TaskSchedulingPolicy policy);
@@ -104,7 +104,6 @@ public:
 
 private:
 	struct ProducerSchedulingState {
-		int64_t base_priority = 0;
 		idx_t completed_tasks = 0;
 		idx_t in_flight_tasks = 0;
 		uint64_t runtime_micros = 0;

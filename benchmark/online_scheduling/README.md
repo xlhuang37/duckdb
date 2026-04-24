@@ -39,3 +39,5 @@ python3 benchmark/online_scheduling/run_online_tpch.py \
 
 - This script uses the Python DuckDB package and runs independently of the C++ test harness.
 - Available policies: `no_priority`, `srpt`, `las`, `sfq`.
+- `srpt`/`las`/`sfq` require a DuckDB build that includes the `scheduler_policy` setting (i.e., your modified build). If the
+  setting is unavailable, the script will only allow `no_priority` and explain why.

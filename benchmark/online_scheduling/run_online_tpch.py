@@ -59,6 +59,18 @@ def load_tpch_queries_from_repo() -> list[tuple[str, str]]:
     return queries
 
 
+def has_scheduler_policy_setting(con: duckdb.DuckDBPyConnection) -> bool:
+    result = con.execute("SELECT count(*) FROM duckdb_settings() WHERE name='scheduler_policy'").fetchone()
+    return bool(result and result[0] > 0)
+
+
+def try_set_scheduler_policy(con: duckdb.DuckDBPyConnection, scheduler_policy: str) -> bool:
+    if not has_scheduler_policy_setting(con):
+        return False
+    con.execute(f"SET scheduler_policy='{scheduler_policy}'")
+    return True
+
+
 def worker_loop(
     db_path: str,
     scheduler_policy: str,
@@ -67,7 +79,12 @@ def worker_loop(
     results_lock: threading.Lock,
 ) -> None:
     con = duckdb.connect(db_path)
-    con.execute(f"SET scheduler_policy='{scheduler_policy}'")
+    policy_applied = try_set_scheduler_policy(con, scheduler_policy)
+    if scheduler_policy != "no_priority" and not policy_applied:
+        raise RuntimeError(
+            "This DuckDB build does not expose `scheduler_policy`. "
+            "Use your modified DuckDB build/package to benchmark srpt/las/sfq."
+        )
     while True:
         item = work_queue.get()
         if item is None:
@@ -202,8 +219,22 @@ def main() -> None:
 
     if not args.skip_setup:
         setup_tpch_database(args.db_path, args.scale_factor)
+    policy_check_con = duckdb.connect(args.db_path)
+    has_policy_setting = has_scheduler_policy_setting(policy_check_con)
+    policy_check_con.close()
+
+    selected_policies = args.compare_policies if args.compare_policies else [args.scheduler_policy]
+    if not has_policy_setting:
+        non_default_policies = [policy for policy in selected_policies if policy != "no_priority"]
+        if non_default_policies:
+            raise RuntimeError(
+                "scheduler_policy is not available in this DuckDB build, but you requested "
+                f"{', '.join(non_default_policies)}. Build/install the modified DuckDB version first."
+            )
+        print("scheduler_policy is unavailable in this DuckDB build; continuing with no_priority.")
+
     queries = load_tpch_queries_from_repo()
-    policies = args.compare_policies if args.compare_policies else [args.scheduler_policy]
+    policies = selected_policies
     summaries: list[BenchmarkSummary] = []
     for policy in policies:
         print(f"\nRunning policy={policy}")

@@ -298,7 +298,9 @@ void TaskScheduler::SetProducerProgress(ProducerToken &producer, double progress
 
 void TaskScheduler::RegisterProducer(ProducerToken &producer) {
 	lock_guard<mutex> lock(producer_priority_lock);
-	producer_priorities[&producer] = ProducerSchedulingState();
+	ProducerSchedulingState state;
+	state.virtual_runtime_micros = sfq_runtime_frontier;
+	producer_priorities[&producer] = state;
 }
 
 void TaskScheduler::UnregisterProducer(ProducerToken &producer) {
@@ -333,9 +335,14 @@ bool TaskScheduler::TryDequeuePrioritizedProducerTask(shared_ptr<Task> &task) {
 			score = static_cast<double>(entry.second.base_priority) - remaining_cost;
 			break;
 		}
-		case TaskSchedulingPolicy::SFQ:
+		case TaskSchedulingPolicy::LAS:
 			// Smaller service received should dequeue first. We invert the sign to keep "higher score wins".
 			score = static_cast<double>(entry.second.base_priority) - static_cast<double>(entry.second.runtime_micros);
+			break;
+		case TaskSchedulingPolicy::SFQ:
+			// SFQ: flows start at the current frontier instead of zero service to avoid always favoring new producers.
+			score = static_cast<double>(entry.second.base_priority) -
+			        static_cast<double>(entry.second.virtual_runtime_micros);
 			break;
 		}
 		if (first_entry || score > selected_score) {
@@ -379,6 +386,8 @@ void TaskScheduler::RecordTaskCompletion(Task &task, uint64_t runtime_micros) {
 	}
 	entry->second.completed_tasks++;
 	entry->second.runtime_micros += runtime_micros;
+	entry->second.virtual_runtime_micros += runtime_micros;
+	sfq_runtime_frontier = MaxValue<uint64_t>(sfq_runtime_frontier, entry->second.virtual_runtime_micros);
 }
 
 void TaskScheduler::ScheduleTask(ProducerToken &token, shared_ptr<Task> task) {

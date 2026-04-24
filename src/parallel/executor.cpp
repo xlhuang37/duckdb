@@ -6,6 +6,7 @@
 #include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/settings.hpp"
@@ -395,6 +396,16 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 		this->profiler = ClientData::Get(context).profiler;
 		profiler->Initialize(plan);
 		this->producer = scheduler.CreateProducer();
+		auto scheduler_policy = StringUtil::Lower(Settings::Get<SchedulerPolicySetting>(context));
+		if (scheduler_policy == "srpt") {
+			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::SRPT);
+		} else if (scheduler_policy == "las") {
+			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::LAS);
+		} else if (scheduler_policy == "sfq") {
+			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::SFQ);
+		} else {
+			scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::STATIC_PRIORITY);
+		}
 		auto query_priority = Settings::Get<QueryPrioritySetting>(context);
 		if (query_priority == std::numeric_limits<int64_t>::min()) {
 			scheduler.SetProducerQuerySize(*this->producer, plan.estimated_cardinality);

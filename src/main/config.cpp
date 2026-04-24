@@ -209,6 +209,7 @@ static const ConfigurationOption internal_options[] = {
     DUCKDB_SETTING(WriteBufferRowGroupCountSetting),
     DUCKDB_SETTING(ZstdMinStringLengthSetting),
     DUCKDB_SETTING(QueryPrioritySetting),
+    DUCKDB_SETTING(SchedulerPolicySetting),
     FINAL_SETTING};
 
 static const ConfigurationAlias setting_aliases[] = {DUCKDB_SETTING_ALIAS("configure_metrics", 27),

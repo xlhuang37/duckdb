@@ -25,7 +25,7 @@ class TaskScheduler;
 
 struct SchedulerThread;
 
-enum class TaskSchedulingPolicy : uint8_t { STATIC_PRIORITY = 0, SRPT = 1, SFQ = 2 };
+enum class TaskSchedulingPolicy : uint8_t { STATIC_PRIORITY = 0, SRPT = 1, LAS = 2, SFQ = 3 };
 
 struct ProducerToken {
 	ProducerToken(TaskScheduler &scheduler, unique_ptr<QueueProducerToken> token);
@@ -108,6 +108,7 @@ private:
 		idx_t completed_tasks = 0;
 		idx_t in_flight_tasks = 0;
 		uint64_t runtime_micros = 0;
+		uint64_t virtual_runtime_micros = 0;
 		double progress = 0;
 	};
 
@@ -134,6 +135,7 @@ private:
 	mutex producer_priority_lock;
 	unordered_map<ProducerToken *, ProducerSchedulingState> producer_priorities;
 	TaskSchedulingPolicy scheduling_policy = TaskSchedulingPolicy::STATIC_PRIORITY;
+	uint64_t sfq_runtime_frontier = 0;
 	//! The threshold after which to flush the allocator after completing a task
 	atomic<idx_t> allocator_flush_threshold;
 	//! Whether allocator background threads are enabled

@@ -59,13 +59,13 @@ TEST_CASE("Task scheduler SRPT policy prioritizes producers with lower estimated
 	REQUIRE(execution_order[0] == 1);
 }
 
-TEST_CASE("Task scheduler SFQ policy favors producers with lower attained service", "[api]") {
+TEST_CASE("Task scheduler LAS policy favors producers with lower attained service", "[api]") {
 	DBConfig config;
 	config.options.maximum_threads = 1;
 	DuckDB db(nullptr, &config);
 	Connection con(db);
 	auto &scheduler = TaskScheduler::GetScheduler(*db.instance);
-	scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::SFQ);
+	scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::LAS);
 
 	auto producer_a = scheduler.CreateProducer();
 	auto producer_b = scheduler.CreateProducer();
@@ -83,4 +83,34 @@ TEST_CASE("Task scheduler SFQ policy favors producers with lower attained servic
 
 	REQUIRE(execution_order.size() == 2);
 	REQUIRE(execution_order[1] == 3);
+}
+
+TEST_CASE("Task scheduler SFQ policy starts new producers at frontier service", "[api]") {
+	DBConfig config;
+	config.options.maximum_threads = 1;
+	DuckDB db(nullptr, &config);
+	Connection con(db);
+	auto &scheduler = TaskScheduler::GetScheduler(*db.instance);
+	scheduler.SetSchedulingPolicy(TaskSchedulingPolicy::SFQ);
+
+	auto producer_a = scheduler.CreateProducer();
+	vector<int> execution_order;
+	mutex lock;
+	atomic<bool> marker(true);
+
+	// Accumulate service on producer_a to advance the SFQ frontier.
+	scheduler.ScheduleTask(*producer_a, make_shared_ptr<TrackingTask>(execution_order, lock, 1, 25));
+	scheduler.ExecuteTasks(&marker, 1);
+
+	// New producers should start at the current frontier instead of zero service.
+	auto producer_new = scheduler.CreateProducer();
+	scheduler.SetProducerPriority(*producer_a, 0);
+	scheduler.SetProducerPriority(*producer_new, -1);
+
+	scheduler.ScheduleTask(*producer_a, make_shared_ptr<TrackingTask>(execution_order, lock, 2));
+	scheduler.ScheduleTask(*producer_new, make_shared_ptr<TrackingTask>(execution_order, lock, 3));
+	scheduler.ExecuteTasks(&marker, 1);
+
+	REQUIRE(execution_order.size() == 2);
+	REQUIRE(execution_order[1] == 2);
 }

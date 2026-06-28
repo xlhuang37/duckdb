@@ -75,7 +75,7 @@ struct DispatcherState {
 	std::condition_variable cv;
 	atomic<bool> active {false};
 	atomic<bool> wake {false};
-	unique_ptr<thread> thread;
+	unique_ptr<thread> worker;
 };
 #else
 struct DispatcherState {};
@@ -469,13 +469,13 @@ void TaskScheduler::DispatcherLoop() {
 
 void TaskScheduler::StartDispatcher() {
 #ifndef DUCKDB_NO_THREADS
-	if (!affinity_enabled || !dispatcher || dispatcher->thread) {
+	if (!affinity_enabled || !dispatcher || dispatcher->worker) {
 		return;
 	}
 	dispatcher->active = true;
 	dispatcher->wake = false;
 	try {
-		dispatcher->thread = make_uniq<thread>([this]() { DispatcherLoop(); });
+		dispatcher->worker = make_uniq<thread>([this]() { DispatcherLoop(); });
 	} catch (std::exception &) {
 		// could not launch the dispatcher - fall back to plain (unattached) execution
 		dispatcher->active = false;
@@ -485,7 +485,7 @@ void TaskScheduler::StartDispatcher() {
 
 void TaskScheduler::StopDispatcher() {
 #ifndef DUCKDB_NO_THREADS
-	if (!dispatcher || !dispatcher->thread) {
+	if (!dispatcher || !dispatcher->worker) {
 		return;
 	}
 	{
@@ -494,8 +494,8 @@ void TaskScheduler::StopDispatcher() {
 		dispatcher->wake = true;
 	}
 	dispatcher->cv.notify_one();
-	dispatcher->thread->join();
-	dispatcher->thread.reset();
+	dispatcher->worker->join();
+	dispatcher->worker.reset();
 #endif
 }
 

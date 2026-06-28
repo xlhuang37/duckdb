@@ -129,6 +129,11 @@ bool Pipeline::ScheduleParallel(shared_ptr<Event> &event) {
 	if (max_threads > active_threads) {
 		max_threads = active_threads;
 	}
+	// elastic parallelism: optionally cap the per-query task count to trade memory/parallelism for prioritization
+	auto query_max_threads = scheduler.GetQueryMaxThreads();
+	if (query_max_threads > 0 && max_threads > query_max_threads) {
+		max_threads = query_max_threads;
+	}
 	if (sink && sink->sink_state) {
 		max_threads = sink->sink_state->MaxThreads(max_threads);
 	}

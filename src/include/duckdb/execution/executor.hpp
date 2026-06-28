@@ -162,7 +162,7 @@ private:
 	//! The current root pipeline index
 	idx_t root_pipeline_idx;
 	//! The producer of this query
-	unique_ptr<ProducerToken> producer;
+	shared_ptr<ProducerToken> producer;
 	//! List of events
 	vector<shared_ptr<Event>> events;
 	//! The query profiler

@@ -3,19 +3,46 @@
 #include "duckdb/common/chrono.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/numeric_utils.hpp"
+#include "duckdb/common/printer.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/database.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/block_allocator.hpp"
+
+#include <algorithm>
+#include <cstdlib>
 #ifndef DUCKDB_NO_THREADS
 #include "concurrentqueue.h"
 #include "duckdb/common/thread.hpp"
 #include "lightweightsemaphore.h"
 
+#include <condition_variable>
 #include <thread>
 #else
 #include <queue>
 #endif
+
+namespace {
+//! Read an unsigned integer environment variable, returning `fallback` if unset/invalid.
+duckdb::idx_t ReadEnvIdx(const char *name, duckdb::idx_t fallback) {
+	const char *value = std::getenv(name); // NOLINT: prototype knob
+	if (!value || value[0] == '\0') {
+		return fallback;
+	}
+	char *end = nullptr;
+	auto parsed = std::strtoull(value, &end, 10);
+	if (end == value) {
+		return fallback;
+	}
+	return static_cast<duckdb::idx_t>(parsed);
+}
+
+bool ReadEnvBool(const char *name) {
+	const char *value = std::getenv(name); // NOLINT: prototype knob
+	return value && (value[0] == '1' || value[0] == 't' || value[0] == 'T' || value[0] == 'y' || value[0] == 'Y');
+}
+} // namespace
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -34,8 +61,25 @@ struct SchedulerThread {
 	}
 
 	unique_ptr<thread> internal_thread;
+	//! Affinity mailbox: the query this worker is currently attached to (written by the dispatcher, read by the
+	//! worker). Guarded by mailbox_lock; the worker lock()s the weak_ptr for the duration of an attached dequeue.
+	mutex mailbox_lock;
+	weak_ptr<ProducerToken> assigned;
 #endif
 };
+
+#ifndef DUCKDB_NO_THREADS
+//! Dispatcher synchronization state, kept out of the header to avoid leaking <condition_variable>/<thread>.
+struct DispatcherState {
+	mutex lock;
+	std::condition_variable cv;
+	atomic<bool> active {false};
+	atomic<bool> wake {false};
+	unique_ptr<thread> thread;
+};
+#else
+struct DispatcherState {};
+#endif
 
 #ifndef DUCKDB_NO_THREADS
 typedef duckdb_moodycamel::ConcurrentQueue<shared_ptr<Task>> concurrent_queue_t;
@@ -222,6 +266,7 @@ ProducerToken::ProducerToken(TaskScheduler &scheduler, unique_ptr<QueueProducerT
 }
 
 ProducerToken::~ProducerToken() {
+	scheduler.DeregisterProducer(*this);
 }
 
 TaskScheduler::TaskScheduler(DatabaseInstance &db)
@@ -230,11 +275,27 @@ TaskScheduler::TaskScheduler(DatabaseInstance &db)
       allocator_background_threads(Settings::Get<AllocatorBackgroundThreadsSetting>(db)), requested_thread_count(0),
       current_thread_count(1) {
 	SetAllocatorBackgroundThreads(allocator_background_threads);
+	// read affinity-scheduler knobs from the environment (prototype configuration)
+	affinity_enabled = ReadEnvBool("DUCKDB_AFFINITY_SCHED");
+	affinity_k = MaxValue<idx_t>(ReadEnvIdx("DUCKDB_AFFINITY_K", 8), 1);
+	mlfq_num_bands = MaxValue<idx_t>(ReadEnvIdx("DUCKDB_MLFQ_BANDS", 3), 1);
+	mlfq_threshold_usecs = NumericCast<int64_t>(ReadEnvIdx("DUCKDB_MLFQ_THRESHOLD_US", 100000));
+	affinity_debug = ReadEnvBool("DUCKDB_AFFINITY_DEBUG");
+	query_max_threads = ReadEnvIdx("DUCKDB_QUERY_MAX_THREADS", 0);
+#ifdef DUCKDB_NO_THREADS
+	// no background workers exist without threads, so affinity scheduling has nothing to manage
+	affinity_enabled = false;
+#endif
+	dispatcher = make_uniq<DispatcherState>();
+	// The dispatcher runs for the scheduler's lifetime. It coordinates with thread-pool changes purely through
+	// thread_lock (taken briefly in RebalanceAffinity), so it does not need to be torn down on every RelaunchThreads.
+	StartDispatcher();
 }
 
 TaskScheduler::~TaskScheduler() {
 #ifndef DUCKDB_NO_THREADS
 	try {
+		StopDispatcher();
 		RelaunchThreadsInternal(0, true);
 	} catch (...) {
 		// nothing we can do in the destructor if this fails
@@ -250,9 +311,18 @@ TaskScheduler &TaskScheduler::GetScheduler(DatabaseInstance &db) {
 	return db.GetScheduler();
 }
 
-unique_ptr<ProducerToken> TaskScheduler::CreateProducer() {
-	auto token = make_uniq<QueueProducerToken>(*queue);
-	return make_uniq<ProducerToken>(*this, std::move(token));
+shared_ptr<ProducerToken> TaskScheduler::CreateProducer() {
+	auto queue_token = make_uniq<QueueProducerToken>(*queue);
+	auto token = make_shared_ptr<ProducerToken>(*this, std::move(queue_token));
+	if (affinity_enabled) {
+		{
+			lock_guard<mutex> guard(registry_lock);
+			token->arrival_seq = arrival_counter++;
+			producers[token.get()] = weak_ptr<ProducerToken>(token);
+		}
+		NotifyDispatcher();
+	}
+	return token;
 }
 
 void TaskScheduler::ScheduleTask(ProducerToken &token, shared_ptr<Task> task) {
@@ -268,8 +338,178 @@ bool TaskScheduler::GetTaskFromProducer(ProducerToken &token, shared_ptr<Task> &
 	return queue->DequeueFromProducer(token, task);
 }
 
+void TaskScheduler::DeregisterProducer(ProducerToken &token) {
+	if (!affinity_enabled) {
+		return;
+	}
+	{
+		lock_guard<mutex> guard(registry_lock);
+		producers.erase(&token);
+	}
+	NotifyDispatcher();
+}
+
+void TaskScheduler::NotifyDispatcher() {
+#ifndef DUCKDB_NO_THREADS
+	if (!dispatcher) {
+		return;
+	}
+	{
+		lock_guard<mutex> guard(dispatcher->lock);
+		dispatcher->wake = true;
+	}
+	dispatcher->cv.notify_one();
+#endif
+}
+
+void TaskScheduler::RebalanceAffinity() {
+#ifndef DUCKDB_NO_THREADS
+	// snapshot the live producers (queries) under the registry lock
+	vector<shared_ptr<ProducerToken>> live;
+	{
+		lock_guard<mutex> guard(registry_lock);
+		live.reserve(producers.size());
+		for (auto &entry : producers) {
+			if (auto sp = entry.second.lock()) {
+				live.push_back(std::move(sp));
+			}
+		}
+	}
+
+	// compute the priority band of each query from its attained CPU service. Bands grow geometrically: a query is
+	// demoted one band each time its service crosses the next (doubling) cumulative threshold. Band 0 is highest.
+	for (auto &q : live) {
+		auto service = q->attained_service_usecs.load();
+		idx_t band = 0;
+		int64_t threshold = mlfq_threshold_usecs;
+		while (band + 1 < mlfq_num_bands && service >= threshold) {
+			band++;
+			threshold += mlfq_threshold_usecs << band; // geometric growth
+		}
+		q->band.store(band);
+	}
+
+	// order by (band asc, arrival asc) -> absolute priority with FIFO tie-break
+	std::sort(live.begin(), live.end(), [](const shared_ptr<ProducerToken> &a, const shared_ptr<ProducerToken> &b) {
+		auto ba = a->band.load();
+		auto bb = b->band.load();
+		if (ba != bb) {
+			return ba < bb;
+		}
+		return a->arrival_seq < b->arrival_seq;
+	});
+
+	// assign up to affinity_k workers to each query in priority order until workers are exhausted; remaining workers
+	// are left unattached (they pull from the global queue).
+	lock_guard<mutex> tguard(thread_lock);
+	const idx_t worker_count = threads.size();
+	vector<weak_ptr<ProducerToken>> assignment(worker_count); // default-constructed == unattached
+	idx_t widx = 0;
+	for (auto &q : live) {
+		if (widx >= worker_count) {
+			break;
+		}
+		for (idx_t i = 0; i < affinity_k && widx < worker_count; i++, widx++) {
+			assignment[widx] = weak_ptr<ProducerToken>(q);
+		}
+	}
+
+	for (idx_t i = 0; i < worker_count; i++) {
+		auto &slot = *threads[i];
+		lock_guard<mutex> mguard(slot.mailbox_lock);
+		// hysteresis: only count a reassignment when the target actually changes
+		auto cur = slot.assigned.lock();
+		auto next = assignment[i].lock();
+		if (cur.get() != next.get()) {
+			stat_reassignments++;
+		}
+		slot.assigned = assignment[i];
+	}
+
+	if (affinity_debug) {
+		Printer::Print(StringUtil::Format(
+		    "[affinity] rebalance: queries=%llu workers=%llu wakeups=%llu reassignments=%llu hits=%llu misses=%llu",
+		    (unsigned long long)live.size(), (unsigned long long)worker_count,
+		    (unsigned long long)stat_dispatcher_wakeups.load(), (unsigned long long)stat_reassignments.load(),
+		    (unsigned long long)stat_attached_hits.load(), (unsigned long long)stat_attached_misses.load()));
+	}
+#endif
+}
+
+void TaskScheduler::DispatcherLoop() {
+#ifndef DUCKDB_NO_THREADS
+	// Re-evaluation interval while queries are active. The dispatcher sleeps indefinitely when idle (no producers) and
+	// is woken by NotifyDispatcher() on arrivals/completions, so it never busy-spins.
+	static constexpr const int64_t REEVAL_INTERVAL_MS = 5;
+	while (dispatcher->active) {
+		{
+			std::unique_lock<std::mutex> lk(dispatcher->lock);
+			bool has_queries;
+			{
+				lock_guard<mutex> guard(registry_lock);
+				has_queries = !producers.empty();
+			}
+			if (!dispatcher->wake) {
+				if (has_queries) {
+					dispatcher->cv.wait_for(lk, std::chrono::milliseconds(REEVAL_INTERVAL_MS));
+				} else {
+					dispatcher->cv.wait(lk);
+				}
+			}
+			dispatcher->wake = false;
+		}
+		if (!dispatcher->active) {
+			break;
+		}
+		stat_dispatcher_wakeups++;
+		RebalanceAffinity();
+	}
+#endif
+}
+
+void TaskScheduler::StartDispatcher() {
+#ifndef DUCKDB_NO_THREADS
+	if (!affinity_enabled || !dispatcher || dispatcher->thread) {
+		return;
+	}
+	dispatcher->active = true;
+	dispatcher->wake = false;
+	try {
+		dispatcher->thread = make_uniq<thread>([this]() { DispatcherLoop(); });
+	} catch (std::exception &) {
+		// could not launch the dispatcher - fall back to plain (unattached) execution
+		dispatcher->active = false;
+	}
+#endif
+}
+
+void TaskScheduler::StopDispatcher() {
+#ifndef DUCKDB_NO_THREADS
+	if (!dispatcher || !dispatcher->thread) {
+		return;
+	}
+	{
+		lock_guard<mutex> guard(dispatcher->lock);
+		dispatcher->active = false;
+		dispatcher->wake = true;
+	}
+	dispatcher->cv.notify_one();
+	dispatcher->thread->join();
+	dispatcher->thread.reset();
+#endif
+}
+
 void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 #ifndef DUCKDB_NO_THREADS
+	// no worker slot -> always runs as an unattached worker (plain global-queue execution)
+	ExecuteForeverInternal(marker, nullptr);
+#else
+	throw NotImplementedException("DuckDB was compiled without threads! Background thread loop is not allowed.");
+#endif
+}
+
+#ifndef DUCKDB_NO_THREADS
+void TaskScheduler::ExecuteForeverInternal(atomic<bool> *marker, optional_ptr<SchedulerThread> slot) {
 	static constexpr const int64_t INITIAL_FLUSH_WAIT = 500000; // initial wait time of 0.5s (in mus) before flushing
 
 	const auto &block_allocator = BlockAllocator::Get(db);
@@ -299,12 +539,46 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 				}
 			}
 		}
-		if (queue->Dequeue(task)) {
+
+		// Affinity: if the dispatcher attached this worker to a query, try that query's producer first. If it has no
+		// ready work, fall back to the global queue (the "normal route") so the worker never idles needlessly.
+		bool got_task = false;
+		if (affinity_enabled && slot) {
+			shared_ptr<ProducerToken> attached;
+			{
+				lock_guard<mutex> mguard(slot->mailbox_lock);
+				attached = slot->assigned.lock();
+			}
+			if (attached) {
+				got_task = queue->DequeueFromProducer(*attached, task);
+				if (got_task) {
+					stat_attached_hits++;
+				} else {
+					stat_attached_misses++;
+				}
+			}
+		}
+		if (!got_task) {
+			got_task = queue->Dequeue(task);
+		}
+
+		if (got_task) {
 			auto process_mode = TaskExecutionMode::PROCESS_ALL;
-			if (Settings::Get<SchedulerProcessPartialSetting>(config)) {
+			// affinity scheduling relies on partial processing so tasks yield, letting us account CPU service and let
+			// the dispatcher re-evaluate priority bands at task granularity.
+			if (affinity_enabled || Settings::Get<SchedulerProcessPartialSetting>(config)) {
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
 			}
+
+			optional_ptr<ProducerToken> charge_token = task->token;
+			auto exec_begin = std::chrono::steady_clock::now();
 			auto execute_result = task->Execute(process_mode);
+			if (affinity_enabled && charge_token) {
+				auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+				                   std::chrono::steady_clock::now() - exec_begin)
+				                   .count();
+				charge_token->attained_service_usecs.fetch_add(NumericCast<int64_t>(elapsed));
+			}
 
 			switch (execute_result) {
 			case TaskExecutionResult::TASK_FINISHED:
@@ -332,10 +606,8 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 		block_allocator.ThreadFlush(allocator_background_threads, 0, NumericCast<idx_t>(requested_thread_count.load()));
 		Allocator::ThreadIdle();
 	}
-#else
-	throw NotImplementedException("DuckDB was compiled without threads! Background thread loop is not allowed.");
-#endif
 }
+#endif
 
 idx_t TaskScheduler::ExecuteTasks(atomic<bool> *marker, idx_t max_tasks) {
 #ifndef DUCKDB_NO_THREADS
@@ -400,8 +672,8 @@ void TaskScheduler::ExecuteTasks(idx_t max_tasks) {
 }
 
 #ifndef DUCKDB_NO_THREADS
-static void ThreadExecuteTasks(TaskScheduler *scheduler, atomic<bool> *marker) {
-	scheduler->ExecuteForever(marker);
+static void ThreadExecuteTasks(TaskScheduler *scheduler, atomic<bool> *marker, SchedulerThread *slot) {
+	scheduler->ExecuteForeverInternal(marker, slot);
 }
 #endif
 
@@ -560,9 +832,13 @@ void TaskScheduler::RelaunchThreadsInternal(int32_t n, bool destroy) {
 		for (idx_t i = 0; i < create_new_threads; i++) {
 			// launch a thread and assign it a cancellation marker
 			auto marker = unique_ptr<atomic<bool>>(new atomic<bool>(true));
+			// create the worker slot (mailbox) first so the worker can safely read it from the start; the thread
+			// receives a stable pointer to the slot and the actual thread handle is stored back into it afterwards.
+			auto thread_wrapper = make_uniq<SchedulerThread>(unique_ptr<thread>());
+			auto *slot = thread_wrapper.get();
 			unique_ptr<thread> worker_thread;
 			try {
-				worker_thread = make_uniq<thread>(ThreadExecuteTasks, this, marker.get());
+				worker_thread = make_uniq<thread>(ThreadExecuteTasks, this, marker.get(), slot);
 				if (pin_threads) {
 					SetThreadAffinity(*worker_thread, NumericCast<int>(threads.size()));
 				}
@@ -571,7 +847,7 @@ void TaskScheduler::RelaunchThreadsInternal(int32_t n, bool destroy) {
 				// in this case we cannot allocate more threads - stop launching them
 				break;
 			}
-			auto thread_wrapper = make_uniq<SchedulerThread>(std::move(worker_thread));
+			slot->internal_thread = std::move(worker_thread);
 
 			threads.push_back(std::move(thread_wrapper));
 			markers.push_back(std::move(marker));

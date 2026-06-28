@@ -11,6 +11,8 @@
 #include "duckdb/common/atomic.hpp"
 #include "duckdb/common/common.hpp"
 #include "duckdb/common/mutex.hpp"
+#include "duckdb/common/optional_ptr.hpp"
+#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/vector.hpp"
 #include "duckdb/parallel/task.hpp"
 
@@ -18,12 +20,17 @@ namespace duckdb {
 
 struct ConcurrentQueue;
 struct QueueProducerToken;
+struct DispatcherState;
 class ClientContext;
 class DatabaseInstance;
 class TaskScheduler;
 
 struct SchedulerThread;
 
+//! A ProducerToken identifies a single query/producer to the scheduler. In the affinity-aware (MLFQ) scheduler it also
+//! doubles as the Query Control Block (QCB): it accumulates the CPU service attained by this query and caches the
+//! priority band the dispatcher last assigned to it. Tokens are reference counted (shared_ptr) so the dispatcher and
+//! worker mailboxes can safely hold weak_ptrs and lock() them for the duration of an affinity dequeue.
 struct ProducerToken {
 	ProducerToken(TaskScheduler &scheduler, unique_ptr<QueueProducerToken> token);
 	~ProducerToken();
@@ -31,6 +38,13 @@ struct ProducerToken {
 	TaskScheduler &scheduler;
 	unique_ptr<QueueProducerToken> token;
 	mutex producer_lock;
+
+	//! QCB: total CPU service (in microseconds) attained by tasks of this query
+	atomic<int64_t> attained_service_usecs {0};
+	//! QCB: priority band last computed by the dispatcher (0 == highest priority)
+	atomic<idx_t> band {0};
+	//! QCB: monotonically increasing arrival sequence used as a tie-breaker within a band (FIFO)
+	idx_t arrival_seq {0};
 };
 
 //! The TaskScheduler is responsible for managing tasks and threads
@@ -45,7 +59,7 @@ public:
 	DUCKDB_API static TaskScheduler &GetScheduler(ClientContext &context);
 	DUCKDB_API static TaskScheduler &GetScheduler(DatabaseInstance &db);
 
-	unique_ptr<ProducerToken> CreateProducer();
+	shared_ptr<ProducerToken> CreateProducer();
 	//! Schedule a task to be executed by the task scheduler
 	void ScheduleTask(ProducerToken &producer, shared_ptr<Task> task);
 	void ScheduleTasks(ProducerToken &producer, vector<shared_ptr<Task>> &tasks);
@@ -53,6 +67,8 @@ public:
 	bool GetTaskFromProducer(ProducerToken &token, shared_ptr<Task> &task);
 	//! Run tasks forever until "marker" is set to false, "marker" must remain valid until the thread is joined
 	void ExecuteForever(atomic<bool> *marker);
+	//! Worker loop variant that also receives its scheduler-thread slot (for affinity mailbox access)
+	void ExecuteForeverInternal(atomic<bool> *marker, optional_ptr<SchedulerThread> slot);
 	//! Run tasks until `marker` is set to false, `max_tasks` have been completed, or until there are no more tasks
 	//! available. Returns the number of tasks that were completed.
 	idx_t ExecuteTasks(atomic<bool> *marker, idx_t max_tasks);
@@ -89,8 +105,27 @@ public:
 	//! Result do not need to be exact 'return 0' is a valid fallback strategy
 	static idx_t GetEstimatedCPUId();
 
+	//! Whether the affinity-aware (MLFQ) scheduler is enabled (DUCKDB_AFFINITY_SCHED)
+	bool AffinityEnabled() const {
+		return affinity_enabled;
+	}
+	//! Global elastic-parallelism cap (DUCKDB_QUERY_MAX_THREADS), 0 means disabled
+	idx_t GetQueryMaxThreads() const {
+		return query_max_threads;
+	}
+
 private:
 	void RelaunchThreadsInternal(int32_t n, bool destroy);
+
+	//! Remove a producer (query) from the dispatcher registry (called from ~ProducerToken)
+	void DeregisterProducer(ProducerToken &token);
+	//! Wake the dispatcher so it can re-evaluate worker affinity
+	void NotifyDispatcher();
+	//! Dispatcher thread main loop and the affinity (re)assignment routine
+	void DispatcherLoop();
+	void RebalanceAffinity();
+	void StartDispatcher();
+	void StopDispatcher();
 
 private:
 	DatabaseInstance &db;
@@ -110,6 +145,37 @@ private:
 	atomic<int32_t> requested_thread_count;
 	//! The amount of threads currently running
 	atomic<int32_t> current_thread_count;
+
+	//! ----- Affinity-aware (MLFQ) scheduler state -----
+	//! Whether affinity scheduling is enabled (read once from the environment at construction)
+	bool affinity_enabled = false;
+	//! Number of workers to attach per query, in priority order (DUCKDB_AFFINITY_K)
+	idx_t affinity_k = 8;
+	//! Number of MLFQ priority bands (DUCKDB_MLFQ_BANDS)
+	idx_t mlfq_num_bands = 3;
+	//! Base per-band CPU-service threshold in microseconds; bands grow geometrically (DUCKDB_MLFQ_THRESHOLD_US)
+	int64_t mlfq_threshold_usecs = 100000;
+	//! Whether to print dispatcher debug information (DUCKDB_AFFINITY_DEBUG)
+	bool affinity_debug = false;
+	//! Global elastic-parallelism cap (DUCKDB_QUERY_MAX_THREADS), 0 == disabled
+	idx_t query_max_threads = 0;
+
+	//! Registry of live producers (queries), keyed by raw pointer, holding a weak_ptr for safe access
+	mutex registry_lock;
+	unordered_map<ProducerToken *, weak_ptr<ProducerToken>> producers;
+	//! Monotonic arrival counter assigned to producers as they register
+	atomic<idx_t> arrival_counter {0};
+
+	//! Dispatcher synchronization/thread state (pimpl to keep heavy includes out of the header)
+	unique_ptr<DispatcherState> dispatcher;
+
+	//! Instrumentation counters
+	atomic<idx_t> stat_dispatcher_wakeups {0};
+	atomic<idx_t> stat_reassignments {0};
+	atomic<idx_t> stat_attached_hits {0};
+	atomic<idx_t> stat_attached_misses {0};
+
+	friend struct ProducerToken;
 };
 
 } // namespace duckdb

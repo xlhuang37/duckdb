@@ -6,6 +6,7 @@
 #include "duckdb/execution/operator/set/physical_cte.hpp"
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/common/numeric_utils.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/settings.hpp"
@@ -586,8 +587,18 @@ PendingExecutionResult Executor::ExecuteTask(bool dry_run) {
 		}
 
 		if (current_task) {
-			// if we have a task, partially process it
+			// if we have a task, partially process it. The calling (client) thread also contributes CPU service to
+			// the query, so charge it to the producer/QCB when the affinity scheduler is active.
+			auto &exec_scheduler = TaskScheduler::GetScheduler(context);
+			optional_ptr<ProducerToken> charge_token = task->token;
+			auto exec_begin = std::chrono::steady_clock::now();
 			auto result = task->Execute(TaskExecutionMode::PROCESS_PARTIAL);
+			if (exec_scheduler.AffinityEnabled() && charge_token) {
+				auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+				                   std::chrono::steady_clock::now() - exec_begin)
+				                   .count();
+				charge_token->attained_service_usecs.fetch_add(NumericCast<int64_t>(elapsed));
+			}
 			if (result == TaskExecutionResult::TASK_BLOCKED) {
 				task->Deschedule();
 				task.reset();

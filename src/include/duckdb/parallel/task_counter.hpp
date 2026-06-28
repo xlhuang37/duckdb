@@ -39,7 +39,7 @@ public:
 
 private:
 	TaskScheduler &scheduler;
-	unique_ptr<ProducerToken> token;
+	shared_ptr<ProducerToken> token;
 	size_t task_count;
 	mutable atomic<size_t> tasks_completed;
 };

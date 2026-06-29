@@ -8,10 +8,10 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/block_allocator.hpp"
 #ifndef DUCKDB_NO_THREADS
-#include "concurrentqueue.h"
 #include "duckdb/common/thread.hpp"
 #include "lightweightsemaphore.h"
 
+#include <deque>
 #include <thread>
 #else
 #include <queue>
@@ -38,15 +38,40 @@ struct SchedulerThread {
 };
 
 #ifndef DUCKDB_NO_THREADS
-typedef duckdb_moodycamel::ConcurrentQueue<shared_ptr<Task>> concurrent_queue_t;
 typedef duckdb_moodycamel::LightweightSemaphore lightweight_semaphore_t;
 
+struct QueryNodeTaskQueue {
+	std::deque<shared_ptr<Task>> available_tasks;
+};
+
+struct QueryNodeCPUTime {
+	idx_t executions = 0;
+};
+
+struct QueryNode {
+	QueryNode() : task_queue(make_uniq<QueryNodeTaskQueue>()), cpu_time(make_uniq<QueryNodeCPUTime>()) {
+	}
+
+	unique_ptr<QueryNodeTaskQueue> task_queue;
+	unique_ptr<QueryNodeCPUTime> cpu_time;
+	idx_t task_count = 0;
+	bool in_runnable_queue = false;
+	idx_t runnable_generation = 0;
+};
+
+struct RunnableQueryNode {
+	QueryNode *node;
+	idx_t generation;
+};
+
 struct ConcurrentQueue {
-	ConcurrentQueue() : tasks_in_queue(0) {
+	ConcurrentQueue() : tasks_in_queue(0), producer_count(0) {
 	}
 
 	lightweight_semaphore_t semaphore;
 
+	void RegisterProducer();
+	void RemoveProducer(QueryNode &node);
 	void Enqueue(ProducerToken &token, shared_ptr<Task> task);
 	void EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>> &tasks);
 	bool DequeueFromProducer(ProducerToken &token, shared_ptr<Task> &task);
@@ -55,77 +80,165 @@ struct ConcurrentQueue {
 	idx_t GetApproxSize() const;
 	idx_t GetProducerCount() const;
 	idx_t GetTaskCountForProducer(ProducerToken &token) const;
-	concurrent_queue_t &GetQueue() {
-		return q;
-	}
 
 private:
-	concurrent_queue_t q;
-	atomic<idx_t> tasks_in_queue;
+	void EnqueueLocked(QueryNode &node, shared_ptr<Task> task);
+	void MarkRunnableLocked(QueryNode &node);
+	void RemoveRunnableEntriesLocked(QueryNode &node);
+
+	mutable mutex qlock;
+	std::deque<RunnableQueryNode> runnable_nodes;
+	idx_t tasks_in_queue;
+	idx_t producer_count;
 };
 
 struct QueueProducerToken {
-	explicit QueueProducerToken(ConcurrentQueue &queue) : queue_token(queue.GetQueue()) {
+	explicit QueueProducerToken(ConcurrentQueue &queue) : queue(queue), node(make_uniq<QueryNode>()) {
+		queue.RegisterProducer();
 	}
 
-	duckdb_moodycamel::ProducerToken queue_token;
+	~QueueProducerToken() {
+		queue.RemoveProducer(*node);
+	}
+
+	QueryNode &GetNode() {
+		return *node;
+	}
+
+private:
+	ConcurrentQueue &queue;
+	unique_ptr<QueryNode> node;
 };
 
-void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
-	lock_guard<mutex> producer_lock(token.producer_lock);
-	task->token = token;
-	if (q.enqueue(token.token->queue_token, std::move(task))) {
-		++tasks_in_queue;
-		semaphore.signal();
-	} else {
-		throw InternalException("Could not schedule task!");
+void ConcurrentQueue::RegisterProducer() {
+	lock_guard<mutex> lock(qlock);
+	producer_count++;
+}
+
+void ConcurrentQueue::RemoveRunnableEntriesLocked(QueryNode &node) {
+	for (auto entry = runnable_nodes.begin(); entry != runnable_nodes.end();) {
+		if (entry->node == &node) {
+			entry = runnable_nodes.erase(entry);
+		} else {
+			++entry;
+		}
 	}
+}
+
+void ConcurrentQueue::RemoveProducer(QueryNode &node) {
+	lock_guard<mutex> lock(qlock);
+	if (node.task_count > 0) {
+		tasks_in_queue -= node.task_count;
+		node.task_count = 0;
+		node.task_queue->available_tasks.clear();
+	}
+	node.in_runnable_queue = false;
+	node.runnable_generation++;
+	RemoveRunnableEntriesLocked(node);
+	producer_count--;
+}
+
+void ConcurrentQueue::MarkRunnableLocked(QueryNode &node) {
+	if (node.task_count == 0 || node.in_runnable_queue) {
+		return;
+	}
+	node.in_runnable_queue = true;
+	node.runnable_generation++;
+	runnable_nodes.push_back(RunnableQueryNode {&node, node.runnable_generation});
+}
+
+void ConcurrentQueue::EnqueueLocked(QueryNode &node, shared_ptr<Task> task) {
+	node.task_queue->available_tasks.push_back(std::move(task));
+	node.task_count++;
+	tasks_in_queue++;
+	MarkRunnableLocked(node);
+}
+
+void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
+	{
+		lock_guard<mutex> producer_lock(token.producer_lock);
+		task->token = token;
+		lock_guard<mutex> lock(qlock);
+		EnqueueLocked(token.token->GetNode(), std::move(task));
+	}
+	semaphore.signal();
 }
 
 void ConcurrentQueue::EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>> &tasks) {
 	typedef std::make_signed<std::size_t>::type ssize_t;
-	lock_guard<mutex> producer_lock(token.producer_lock);
-	for (auto &task : tasks) {
-		task->token = token;
+	const auto task_count = tasks.size();
+	{
+		lock_guard<mutex> producer_lock(token.producer_lock);
+		lock_guard<mutex> lock(qlock);
+		for (auto &task : tasks) {
+			task->token = token;
+			EnqueueLocked(token.token->GetNode(), std::move(task));
+		}
 	}
-	if (q.enqueue_bulk(token.token->queue_token, std::make_move_iterator(tasks.begin()), tasks.size())) {
-		tasks_in_queue += tasks.size();
-		semaphore.signal(NumericCast<ssize_t>(tasks.size()));
-	} else {
-		throw InternalException("Could not schedule tasks!");
+	if (task_count > 0) {
+		semaphore.signal(NumericCast<ssize_t>(task_count));
 	}
 }
 
 bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task> &task) {
 	lock_guard<mutex> producer_lock(token.producer_lock);
-	if (!q.try_dequeue_from_producer(token.token->queue_token, task)) {
+	lock_guard<mutex> lock(qlock);
+
+	auto &node = token.token->GetNode();
+	if (node.task_count == 0) {
 		return false;
 	}
-	--tasks_in_queue;
+	task = std::move(node.task_queue->available_tasks.front());
+	node.task_queue->available_tasks.pop_front();
+	node.task_count--;
+	tasks_in_queue--;
+	node.cpu_time->executions++;
+	if (node.task_count == 0) {
+		node.in_runnable_queue = false;
+		node.runnable_generation++;
+	}
 	return true;
 }
 
 bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
-	if (!q.try_dequeue(task)) {
-		return false;
+	lock_guard<mutex> lock(qlock);
+	while (!runnable_nodes.empty()) {
+		auto entry = runnable_nodes.front();
+		runnable_nodes.pop_front();
+
+		auto &node = *entry.node;
+		if (!node.in_runnable_queue || entry.generation != node.runnable_generation || node.task_count == 0) {
+			continue;
+		}
+
+		node.in_runnable_queue = false;
+		task = std::move(node.task_queue->available_tasks.front());
+		node.task_queue->available_tasks.pop_front();
+		node.task_count--;
+		tasks_in_queue--;
+		node.cpu_time->executions++;
+		MarkRunnableLocked(node);
+		return true;
 	}
-	--tasks_in_queue;
-	return true;
+	return false;
 }
 
 idx_t ConcurrentQueue::GetTasksInQueue() const {
+	lock_guard<mutex> lock(qlock);
 	return tasks_in_queue;
 }
 idx_t ConcurrentQueue::GetApproxSize() const {
-	return q.size_approx();
+	return GetTasksInQueue();
 }
 idx_t ConcurrentQueue::GetProducerCount() const {
-	return q.size_producers_approx();
+	lock_guard<mutex> lock(qlock);
+	return producer_count;
 }
 
 idx_t ConcurrentQueue::GetTaskCountForProducer(ProducerToken &token) const {
 	lock_guard<mutex> producer_lock(token.producer_lock);
-	return q.size_producer_approx(token.token->queue_token);
+	lock_guard<mutex> lock(qlock);
+	return token.token->GetNode().task_count;
 }
 
 #else

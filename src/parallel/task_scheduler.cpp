@@ -8,6 +8,7 @@
 #include "duckdb/main/settings.hpp"
 #include "duckdb/storage/block_allocator.hpp"
 #ifndef DUCKDB_NO_THREADS
+#include "concurrentqueue.h"
 #include "duckdb/common/thread.hpp"
 #include "lightweightsemaphore.h"
 
@@ -48,8 +49,8 @@ struct QueryNodeCPUTime {
 	idx_t executions = 0;
 };
 
-struct QueryNode {
-	QueryNode() : task_queue(make_uniq<QueryNodeTaskQueue>()), cpu_time(make_uniq<QueryNodeCPUTime>()) {
+struct TaskSchedulerQueryNode {
+	TaskSchedulerQueryNode() : task_queue(make_uniq<QueryNodeTaskQueue>()), cpu_time(make_uniq<QueryNodeCPUTime>()) {
 	}
 
 	unique_ptr<QueryNodeTaskQueue> task_queue;
@@ -60,7 +61,7 @@ struct QueryNode {
 };
 
 struct RunnableQueryNode {
-	QueryNode *node;
+	TaskSchedulerQueryNode *node;
 	idx_t generation;
 };
 
@@ -71,7 +72,7 @@ struct ConcurrentQueue {
 	lightweight_semaphore_t semaphore;
 
 	void RegisterProducer();
-	void RemoveProducer(QueryNode &node);
+	void RemoveProducer(TaskSchedulerQueryNode &node);
 	void Enqueue(ProducerToken &token, shared_ptr<Task> task);
 	void EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>> &tasks);
 	bool DequeueFromProducer(ProducerToken &token, shared_ptr<Task> &task);
@@ -82,9 +83,9 @@ struct ConcurrentQueue {
 	idx_t GetTaskCountForProducer(ProducerToken &token) const;
 
 private:
-	void EnqueueLocked(QueryNode &node, shared_ptr<Task> task);
-	void MarkRunnableLocked(QueryNode &node);
-	void RemoveRunnableEntriesLocked(QueryNode &node);
+	void EnqueueLocked(TaskSchedulerQueryNode &node, shared_ptr<Task> task);
+	void MarkRunnableLocked(TaskSchedulerQueryNode &node);
+	void RemoveRunnableEntriesLocked(TaskSchedulerQueryNode &node);
 
 	mutable mutex qlock;
 	std::deque<RunnableQueryNode> runnable_nodes;
@@ -93,7 +94,7 @@ private:
 };
 
 struct QueueProducerToken {
-	explicit QueueProducerToken(ConcurrentQueue &queue) : queue(queue), node(make_uniq<QueryNode>()) {
+	explicit QueueProducerToken(ConcurrentQueue &queue) : queue(queue), node(make_uniq<TaskSchedulerQueryNode>()) {
 		queue.RegisterProducer();
 	}
 
@@ -101,13 +102,13 @@ struct QueueProducerToken {
 		queue.RemoveProducer(*node);
 	}
 
-	QueryNode &GetNode() {
+	TaskSchedulerQueryNode &GetNode() {
 		return *node;
 	}
 
 private:
 	ConcurrentQueue &queue;
-	unique_ptr<QueryNode> node;
+	unique_ptr<TaskSchedulerQueryNode> node;
 };
 
 void ConcurrentQueue::RegisterProducer() {
@@ -115,7 +116,7 @@ void ConcurrentQueue::RegisterProducer() {
 	producer_count++;
 }
 
-void ConcurrentQueue::RemoveRunnableEntriesLocked(QueryNode &node) {
+void ConcurrentQueue::RemoveRunnableEntriesLocked(TaskSchedulerQueryNode &node) {
 	for (auto entry = runnable_nodes.begin(); entry != runnable_nodes.end();) {
 		if (entry->node == &node) {
 			entry = runnable_nodes.erase(entry);
@@ -125,7 +126,7 @@ void ConcurrentQueue::RemoveRunnableEntriesLocked(QueryNode &node) {
 	}
 }
 
-void ConcurrentQueue::RemoveProducer(QueryNode &node) {
+void ConcurrentQueue::RemoveProducer(TaskSchedulerQueryNode &node) {
 	lock_guard<mutex> lock(qlock);
 	if (node.task_count > 0) {
 		tasks_in_queue -= node.task_count;
@@ -138,7 +139,7 @@ void ConcurrentQueue::RemoveProducer(QueryNode &node) {
 	producer_count--;
 }
 
-void ConcurrentQueue::MarkRunnableLocked(QueryNode &node) {
+void ConcurrentQueue::MarkRunnableLocked(TaskSchedulerQueryNode &node) {
 	if (node.task_count == 0 || node.in_runnable_queue) {
 		return;
 	}
@@ -147,7 +148,7 @@ void ConcurrentQueue::MarkRunnableLocked(QueryNode &node) {
 	runnable_nodes.push_back(RunnableQueryNode {&node, node.runnable_generation});
 }
 
-void ConcurrentQueue::EnqueueLocked(QueryNode &node, shared_ptr<Task> task) {
+void ConcurrentQueue::EnqueueLocked(TaskSchedulerQueryNode &node, shared_ptr<Task> task) {
 	node.task_queue->available_tasks.push_back(std::move(task));
 	node.task_count++;
 	tasks_in_queue++;

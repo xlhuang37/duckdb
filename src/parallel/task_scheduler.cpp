@@ -57,10 +57,11 @@ struct TaskSchedulerQueryNode {
 	unique_ptr<QueryNodeCPUTime> cpu_time;
 	idx_t task_count = 0;
 	idx_t runnable_generation = 0;
+	bool removed = false;
 };
 
 struct RunnableQueryNode {
-	TaskSchedulerQueryNode *node;
+	shared_ptr<TaskSchedulerQueryNode> node;
 	idx_t generation;
 };
 
@@ -71,7 +72,7 @@ struct ConcurrentQueue {
 	lightweight_semaphore_t semaphore;
 
 	void RegisterProducer();
-	void RemoveProducer(TaskSchedulerQueryNode &node);
+	void RemoveProducer(const shared_ptr<TaskSchedulerQueryNode> &node);
 	void Enqueue(ProducerToken &token, shared_ptr<Task> task);
 	void EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>> &tasks);
 	bool DequeueFromProducer(ProducerToken &token, shared_ptr<Task> &task);
@@ -82,8 +83,8 @@ struct ConcurrentQueue {
 	idx_t GetTaskCountForProducer(ProducerToken &token) const;
 
 private:
-	void EnqueueLocked(TaskSchedulerQueryNode &node, shared_ptr<Task> task);
-	void EnqueueRunnableTicketLocked(TaskSchedulerQueryNode &node);
+	void EnqueueLocked(const shared_ptr<TaskSchedulerQueryNode> &node, shared_ptr<Task> task);
+	void EnqueueRunnableTicketLocked(const shared_ptr<TaskSchedulerQueryNode> &node);
 	void RemoveRunnableEntriesLocked(TaskSchedulerQueryNode &node);
 
 	mutable mutex qlock;
@@ -93,21 +94,21 @@ private:
 };
 
 struct QueueProducerToken {
-	explicit QueueProducerToken(ConcurrentQueue &queue) : queue(queue), node(make_uniq<TaskSchedulerQueryNode>()) {
+	explicit QueueProducerToken(ConcurrentQueue &queue) : queue(queue), node(make_shared_ptr<TaskSchedulerQueryNode>()) {
 		queue.RegisterProducer();
 	}
 
 	~QueueProducerToken() {
-		queue.RemoveProducer(*node);
+		queue.RemoveProducer(node);
 	}
 
-	TaskSchedulerQueryNode &GetNode() {
-		return *node;
+	shared_ptr<TaskSchedulerQueryNode> GetNode() {
+		return node;
 	}
 
 private:
 	ConcurrentQueue &queue;
-	unique_ptr<TaskSchedulerQueryNode> node;
+	shared_ptr<TaskSchedulerQueryNode> node;
 };
 
 void ConcurrentQueue::RegisterProducer() {
@@ -117,7 +118,7 @@ void ConcurrentQueue::RegisterProducer() {
 
 void ConcurrentQueue::RemoveRunnableEntriesLocked(TaskSchedulerQueryNode &node) {
 	for (auto entry = runnable_nodes.begin(); entry != runnable_nodes.end();) {
-		if (entry->node == &node) {
+		if (entry->node.get() == &node) {
 			entry = runnable_nodes.erase(entry);
 		} else {
 			++entry;
@@ -125,25 +126,33 @@ void ConcurrentQueue::RemoveRunnableEntriesLocked(TaskSchedulerQueryNode &node) 
 	}
 }
 
-void ConcurrentQueue::RemoveProducer(TaskSchedulerQueryNode &node) {
+void ConcurrentQueue::RemoveProducer(const shared_ptr<TaskSchedulerQueryNode> &node_ptr) {
 	lock_guard<mutex> lock(qlock);
+	auto &node = *node_ptr;
+	if (node.removed) {
+		return;
+	}
 	if (node.task_count > 0) {
 		tasks_in_queue -= node.task_count;
 		node.task_count = 0;
 		node.task_queue->available_tasks.clear();
 	}
+	node.removed = true;
 	node.runnable_generation++;
 	RemoveRunnableEntriesLocked(node);
 	producer_count--;
 }
 
-void ConcurrentQueue::EnqueueRunnableTicketLocked(TaskSchedulerQueryNode &node) {
-	runnable_nodes.push_back(RunnableQueryNode {&node, node.runnable_generation});
+void ConcurrentQueue::EnqueueRunnableTicketLocked(const shared_ptr<TaskSchedulerQueryNode> &node) {
+	runnable_nodes.push_back(RunnableQueryNode {node, node->runnable_generation});
 }
 
-void ConcurrentQueue::EnqueueLocked(TaskSchedulerQueryNode &node, shared_ptr<Task> task) {
-	node.task_queue->available_tasks.push_back(std::move(task));
-	node.task_count++;
+void ConcurrentQueue::EnqueueLocked(const shared_ptr<TaskSchedulerQueryNode> &node, shared_ptr<Task> task) {
+	if (node->removed) {
+		throw InternalException("Cannot schedule task for removed producer");
+	}
+	node->task_queue->available_tasks.push_back(std::move(task));
+	node->task_count++;
 	tasks_in_queue++;
 	EnqueueRunnableTicketLocked(node);
 }
@@ -153,7 +162,8 @@ void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
 		lock_guard<mutex> producer_lock(token.producer_lock);
 		task->token = token;
 		lock_guard<mutex> lock(qlock);
-		EnqueueLocked(token.token->GetNode(), std::move(task));
+		auto node = token.token->GetNode();
+		EnqueueLocked(node, std::move(task));
 	}
 	semaphore.signal();
 }
@@ -164,9 +174,10 @@ void ConcurrentQueue::EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>>
 	{
 		lock_guard<mutex> producer_lock(token.producer_lock);
 		lock_guard<mutex> lock(qlock);
+		auto node = token.token->GetNode();
 		for (auto &task : tasks) {
 			task->token = token;
-			EnqueueLocked(token.token->GetNode(), std::move(task));
+			EnqueueLocked(node, std::move(task));
 		}
 	}
 	if (task_count > 0) {
@@ -178,15 +189,15 @@ bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task>
 	lock_guard<mutex> producer_lock(token.producer_lock);
 	lock_guard<mutex> lock(qlock);
 
-	auto &node = token.token->GetNode();
-	if (node.task_count == 0) {
+	auto node = token.token->GetNode();
+	if (node->task_count == 0) {
 		return false;
 	}
-	task = std::move(node.task_queue->available_tasks.front());
-	node.task_queue->available_tasks.pop_front();
-	node.task_count--;
+	task = std::move(node->task_queue->available_tasks.front());
+	node->task_queue->available_tasks.pop_front();
+	node->task_count--;
 	tasks_in_queue--;
-	node.cpu_time->executions++;
+	node->cpu_time->executions++;
 	return true;
 }
 
@@ -197,7 +208,7 @@ bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
 		runnable_nodes.pop_front();
 
 		auto &node = *entry.node;
-		if (entry.generation != node.runnable_generation || node.task_count == 0) {
+		if (node.removed || entry.generation != node.runnable_generation || node.task_count == 0) {
 			continue;
 		}
 
@@ -226,7 +237,7 @@ idx_t ConcurrentQueue::GetProducerCount() const {
 idx_t ConcurrentQueue::GetTaskCountForProducer(ProducerToken &token) const {
 	lock_guard<mutex> producer_lock(token.producer_lock);
 	lock_guard<mutex> lock(qlock);
-	return token.token->GetNode().task_count;
+	return token.token->GetNode()->task_count;
 }
 
 #else

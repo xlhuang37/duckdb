@@ -15,7 +15,7 @@ namespace duckdb {
 class TaskCounter {
 public:
 	explicit TaskCounter(TaskScheduler &scheduler_p)
-	    : scheduler(scheduler_p), token(scheduler_p.CreateProducer()), task_count(0), tasks_completed(0) {
+	    : scheduler(scheduler_p), token(scheduler_p.CreateQueryNode()), task_count(0), tasks_completed(0) {
 	}
 
 	virtual void AddTask(shared_ptr<Task> task) {
@@ -39,7 +39,7 @@ public:
 
 private:
 	TaskScheduler &scheduler;
-	unique_ptr<ProducerToken> token;
+	unique_ptr<SchedulerQueryNode> token;
 	size_t task_count;
 	mutable atomic<size_t> tasks_completed;
 };

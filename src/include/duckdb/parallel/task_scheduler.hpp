@@ -33,6 +33,25 @@ struct ProducerToken {
 	mutex producer_lock;
 };
 
+//! A SchedulerQueryNode is the per-query handle into the multi-level priority queue. It owns one ProducerToken
+//! per priority level and tracks the accumulated CPU time of the query, which is used to demote the query's
+//! future tasks to lower-priority levels.
+struct SchedulerQueryNode {
+	SchedulerQueryNode(TaskScheduler &scheduler, vector<unique_ptr<ProducerToken>> tokens);
+	~SchedulerQueryNode();
+
+	TaskScheduler &scheduler;
+	//! One producer token per priority level (index 0 = highest priority)
+	vector<unique_ptr<ProducerToken>> tokens;
+	//! Accumulated CPU time (in microseconds) consumed by tasks of this query
+	atomic<int64_t> cpu_time_used;
+
+	//! Compute the current priority level based on accumulated CPU time
+	idx_t ComputeLevel() const;
+	//! Add CPU time (in microseconds) consumed by a task of this query
+	void AddCpuTime(int64_t usecs);
+};
+
 //! The TaskScheduler is responsible for managing tasks and threads
 class TaskScheduler {
 	// timeout for semaphore wait, default 5ms
@@ -45,12 +64,12 @@ public:
 	DUCKDB_API static TaskScheduler &GetScheduler(ClientContext &context);
 	DUCKDB_API static TaskScheduler &GetScheduler(DatabaseInstance &db);
 
-	unique_ptr<ProducerToken> CreateProducer();
+	unique_ptr<SchedulerQueryNode> CreateQueryNode();
 	//! Schedule a task to be executed by the task scheduler
-	void ScheduleTask(ProducerToken &producer, shared_ptr<Task> task);
-	void ScheduleTasks(ProducerToken &producer, vector<shared_ptr<Task>> &tasks);
-	//! Fetches a task from a specific producer, returns true if successful or false if no tasks were available
-	bool GetTaskFromProducer(ProducerToken &token, shared_ptr<Task> &task);
+	void ScheduleTask(SchedulerQueryNode &node, shared_ptr<Task> task);
+	void ScheduleTasks(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks);
+	//! Fetches a task from a specific query node, returns true if successful or false if no tasks were available
+	bool GetTaskFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task);
 	//! Run tasks forever until "marker" is set to false, "marker" must remain valid until the thread is joined
 	void ExecuteForever(atomic<bool> *marker);
 	//! Run tasks until `marker` is set to false, `max_tasks` have been completed, or until there are no more tasks
@@ -71,7 +90,7 @@ public:
 
 	idx_t GetNumberOfTasks() const;
 	idx_t GetProducerCount() const;
-	idx_t GetTaskCountForProducer(ProducerToken &token) const;
+	idx_t GetTaskCountForProducer(SchedulerQueryNode &node) const;
 
 	//! Send signals to n threads, signalling for them to wake up and attempt to execute a task
 	void Signal(idx_t n);

@@ -31,7 +31,7 @@ class ThreadContext;
 class Task;
 
 struct PipelineEventStack;
-struct ProducerToken;
+struct SchedulerQueryNode;
 struct ScheduleEventData;
 
 class Executor {
@@ -92,7 +92,7 @@ public:
 	void CompletePipeline() {
 		completed_pipelines++;
 	}
-	ProducerToken &GetToken() {
+	SchedulerQueryNode &GetToken() {
 		return *producer;
 	}
 	void AddEvent(shared_ptr<Event> event);
@@ -162,7 +162,7 @@ private:
 	//! The current root pipeline index
 	idx_t root_pipeline_idx;
 	//! The producer of this query
-	unique_ptr<ProducerToken> producer;
+	unique_ptr<SchedulerQueryNode> producer;
 	//! List of events
 	vector<shared_ptr<Event>> events;
 	//! The query profiler

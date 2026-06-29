@@ -7,7 +7,7 @@
 namespace duckdb {
 
 TaskExecutor::TaskExecutor(TaskScheduler &scheduler)
-    : scheduler(scheduler), token(scheduler.CreateProducer()), completed_tasks(0), total_tasks(0) {
+    : scheduler(scheduler), token(scheduler.CreateQueryNode()), completed_tasks(0), total_tasks(0) {
 }
 
 TaskExecutor::TaskExecutor(ClientContext &context_p) : TaskExecutor(TaskScheduler::GetScheduler(context_p)) {

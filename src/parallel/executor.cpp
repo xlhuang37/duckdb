@@ -393,7 +393,7 @@ void Executor::InitializeInternal(PhysicalOperator &plan) {
 
 		this->profiler = ClientData::Get(context).profiler;
 		profiler->Initialize(plan);
-		this->producer = scheduler.CreateProducer();
+		this->producer = scheduler.CreateQueryNode();
 
 		// build and ready the pipelines
 		PipelineBuildState state;

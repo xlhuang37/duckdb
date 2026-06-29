@@ -16,7 +16,7 @@ class ClientContext;
 class Executor;
 class Task;
 class DatabaseInstance;
-struct ProducerToken;
+struct SchedulerQueryNode;
 
 enum class TaskExecutionMode : uint8_t { PROCESS_ALL, PROCESS_PARTIAL };
 
@@ -57,7 +57,7 @@ public:
 	}
 
 public:
-	optional_ptr<ProducerToken> token;
+	optional_ptr<SchedulerQueryNode> token;
 };
 
 } // namespace duckdb

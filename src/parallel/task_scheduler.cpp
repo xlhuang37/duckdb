@@ -56,7 +56,6 @@ struct TaskSchedulerQueryNode {
 	unique_ptr<QueryNodeTaskQueue> task_queue;
 	unique_ptr<QueryNodeCPUTime> cpu_time;
 	idx_t task_count = 0;
-	bool in_runnable_queue = false;
 	idx_t runnable_generation = 0;
 };
 
@@ -84,7 +83,7 @@ struct ConcurrentQueue {
 
 private:
 	void EnqueueLocked(TaskSchedulerQueryNode &node, shared_ptr<Task> task);
-	void MarkRunnableLocked(TaskSchedulerQueryNode &node);
+	void EnqueueRunnableTicketLocked(TaskSchedulerQueryNode &node);
 	void RemoveRunnableEntriesLocked(TaskSchedulerQueryNode &node);
 
 	mutable mutex qlock;
@@ -133,18 +132,12 @@ void ConcurrentQueue::RemoveProducer(TaskSchedulerQueryNode &node) {
 		node.task_count = 0;
 		node.task_queue->available_tasks.clear();
 	}
-	node.in_runnable_queue = false;
 	node.runnable_generation++;
 	RemoveRunnableEntriesLocked(node);
 	producer_count--;
 }
 
-void ConcurrentQueue::MarkRunnableLocked(TaskSchedulerQueryNode &node) {
-	if (node.task_count == 0 || node.in_runnable_queue) {
-		return;
-	}
-	node.in_runnable_queue = true;
-	node.runnable_generation++;
+void ConcurrentQueue::EnqueueRunnableTicketLocked(TaskSchedulerQueryNode &node) {
 	runnable_nodes.push_back(RunnableQueryNode {&node, node.runnable_generation});
 }
 
@@ -152,7 +145,7 @@ void ConcurrentQueue::EnqueueLocked(TaskSchedulerQueryNode &node, shared_ptr<Tas
 	node.task_queue->available_tasks.push_back(std::move(task));
 	node.task_count++;
 	tasks_in_queue++;
-	MarkRunnableLocked(node);
+	EnqueueRunnableTicketLocked(node);
 }
 
 void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
@@ -194,10 +187,6 @@ bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task>
 	node.task_count--;
 	tasks_in_queue--;
 	node.cpu_time->executions++;
-	if (node.task_count == 0) {
-		node.in_runnable_queue = false;
-		node.runnable_generation++;
-	}
 	return true;
 }
 
@@ -208,17 +197,15 @@ bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
 		runnable_nodes.pop_front();
 
 		auto &node = *entry.node;
-		if (!node.in_runnable_queue || entry.generation != node.runnable_generation || node.task_count == 0) {
+		if (entry.generation != node.runnable_generation || node.task_count == 0) {
 			continue;
 		}
 
-		node.in_runnable_queue = false;
 		task = std::move(node.task_queue->available_tasks.front());
 		node.task_queue->available_tasks.pop_front();
 		node.task_count--;
 		tasks_in_queue--;
 		node.cpu_time->executions++;
-		MarkRunnableLocked(node);
 		return true;
 	}
 	return false;

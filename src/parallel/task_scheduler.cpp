@@ -83,7 +83,7 @@ void ConcurrentQueue::Enqueue(SchedulerQueryNode &node, shared_ptr<Task> task) {
 	const auto level = node.ComputeLevel();
 	auto &producer = *node.tokens[level];
 	lock_guard<mutex> producer_lock(producer.producer_lock);
-	task->token = node;
+	task->token = node.shared_from_this();
 	if (q[level].enqueue(producer.token->queue_token, std::move(task))) {
 		++tasks_in_queue;
 		semaphore.signal();
@@ -98,7 +98,7 @@ void ConcurrentQueue::EnqueueBulk(SchedulerQueryNode &node, vector<shared_ptr<Ta
 	auto &producer = *node.tokens[level];
 	lock_guard<mutex> producer_lock(producer.producer_lock);
 	for (auto &task : tasks) {
-		task->token = node;
+		task->token = node.shared_from_this();
 	}
 	if (q[level].enqueue_bulk(producer.token->queue_token, std::make_move_iterator(tasks.begin()), tasks.size())) {
 		tasks_in_queue += tasks.size();
@@ -179,7 +179,7 @@ void ConcurrentQueue::Enqueue(SchedulerQueryNode &node, shared_ptr<Task> task) {
 	lock_guard<mutex> lock(qlock);
 	const auto level = node.ComputeLevel();
 	auto &producer = *node.tokens[level];
-	task->token = node;
+	task->token = node.shared_from_this();
 	q[level][std::ref(*producer.token)].push(std::move(task));
 }
 
@@ -188,7 +188,7 @@ void ConcurrentQueue::EnqueueBulk(SchedulerQueryNode &node, vector<shared_ptr<Ta
 	const auto level = node.ComputeLevel();
 	auto &producer = *node.tokens[level];
 	for (auto &task : tasks) {
-		task->token = node;
+		task->token = node.shared_from_this();
 		q[level][std::ref(*producer.token)].push(std::move(task));
 	}
 }
@@ -355,7 +355,7 @@ TaskScheduler &TaskScheduler::GetScheduler(DatabaseInstance &db) {
 	return db.GetScheduler();
 }
 
-unique_ptr<SchedulerQueryNode> TaskScheduler::CreateQueryNode() {
+shared_ptr<SchedulerQueryNode> TaskScheduler::CreateQueryNode() {
 	// create one producer token per priority level, each bound to the matching level's queue
 	vector<unique_ptr<ProducerToken>> tokens;
 	tokens.reserve(NUM_PRIORITY_LEVELS);
@@ -363,7 +363,7 @@ unique_ptr<SchedulerQueryNode> TaskScheduler::CreateQueryNode() {
 		auto queue_token = make_uniq<QueueProducerToken>(*queue, level);
 		tokens.push_back(make_uniq<ProducerToken>(*this, std::move(queue_token)));
 	}
-	return make_uniq<SchedulerQueryNode>(*this, std::move(tokens));
+	return make_shared_ptr<SchedulerQueryNode>(*this, std::move(tokens));
 }
 
 void TaskScheduler::ScheduleTask(SchedulerQueryNode &node, shared_ptr<Task> task) {

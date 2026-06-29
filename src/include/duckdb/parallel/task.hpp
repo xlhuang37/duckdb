@@ -57,7 +57,9 @@ public:
 	}
 
 public:
-	optional_ptr<SchedulerQueryNode> token;
+	//! The query node that scheduled this task. Held by shared_ptr so the node (and its per-level producer tokens)
+	//! outlives the task even if the owning query finishes while this task is still queued or executing.
+	shared_ptr<SchedulerQueryNode> token;
 };
 
 } // namespace duckdb

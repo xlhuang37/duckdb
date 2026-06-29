@@ -162,7 +162,7 @@ private:
 	//! The current root pipeline index
 	idx_t root_pipeline_idx;
 	//! The producer of this query
-	unique_ptr<SchedulerQueryNode> producer;
+	shared_ptr<SchedulerQueryNode> producer;
 	//! List of events
 	vector<shared_ptr<Event>> events;
 	//! The query profiler

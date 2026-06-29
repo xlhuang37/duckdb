@@ -45,7 +45,7 @@ public:
 private:
 	TaskScheduler &scheduler;
 	TaskErrorManager error_manager;
-	unique_ptr<SchedulerQueryNode> token;
+	shared_ptr<SchedulerQueryNode> token;
 	atomic<idx_t> completed_tasks;
 	atomic<idx_t> total_tasks;
 	friend class BaseExecutorTask;

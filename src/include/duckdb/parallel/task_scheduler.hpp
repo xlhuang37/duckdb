@@ -36,7 +36,9 @@ struct ProducerToken {
 //! A SchedulerQueryNode is the per-query handle into the multi-level priority queue. It owns one ProducerToken
 //! per priority level and tracks the accumulated CPU time of the query, which is used to demote the query's
 //! future tasks to lower-priority levels.
-struct SchedulerQueryNode {
+//! It is shared (via shared_ptr) between the owning query (Executor/TaskExecutor) and every scheduled Task, so it
+//! - and its per-level producer tokens - stays alive as long as any leftover task of the query still references it.
+struct SchedulerQueryNode : public enable_shared_from_this<SchedulerQueryNode> {
 	SchedulerQueryNode(TaskScheduler &scheduler, vector<unique_ptr<ProducerToken>> tokens);
 	~SchedulerQueryNode();
 
@@ -64,7 +66,7 @@ public:
 	DUCKDB_API static TaskScheduler &GetScheduler(ClientContext &context);
 	DUCKDB_API static TaskScheduler &GetScheduler(DatabaseInstance &db);
 
-	unique_ptr<SchedulerQueryNode> CreateQueryNode();
+	shared_ptr<SchedulerQueryNode> CreateQueryNode();
 	//! Schedule a task to be executed by the task scheduler
 	void ScheduleTask(SchedulerQueryNode &node, shared_ptr<Task> task);
 	void ScheduleTasks(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks);

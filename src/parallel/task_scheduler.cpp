@@ -55,6 +55,28 @@ bool ReadEnvBool(const char *name) {
 #endif
 
 namespace duckdb {
+
+//! Number of MLFQ priority bands (band 0 == highest priority). Hardcoded prototype value.
+static constexpr idx_t MLFQ_NUM_BANDS = 3;
+
+#ifndef DUCKDB_NO_THREADS
+//! Cumulative attained-service thresholds (microseconds): a query is in band 0 while its total CPU service is below
+//! BAND0_MAX_US, band 1 while below BAND1_MAX_US, and band 2 beyond. Derived from 5000ms / 22000ms quanta.
+static constexpr int64_t MLFQ_BAND0_MAX_US = 5000000;  // 5000 ms
+static constexpr int64_t MLFQ_BAND1_MAX_US = 22000000; // 22000 ms
+
+//! Map cumulative attained CPU service (in microseconds) to an MLFQ band.
+static idx_t ComputeBand(int64_t attained_service_usecs) {
+	if (attained_service_usecs < MLFQ_BAND0_MAX_US) {
+		return 0;
+	}
+	if (attained_service_usecs < MLFQ_BAND1_MAX_US) {
+		return 1;
+	}
+	return 2;
+}
+#endif
+
 struct SchedulerThread {
 #ifndef DUCKDB_NO_THREADS
 	explicit SchedulerThread(unique_ptr<thread> thread_p) : internal_thread(std::move(thread_p)) {
@@ -90,6 +112,9 @@ struct ConcurrentQueue {
 	}
 
 	lightweight_semaphore_t semaphore;
+	//! When false (affinity scheduler disabled) the queue behaves exactly like upstream: it uses a single band (q[0])
+	//! for both enqueue and dequeue, so default builds are unaffected.
+	bool mlfq_enabled = false;
 
 	void Enqueue(ProducerToken &token, shared_ptr<Task> task);
 	void EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>> &tasks);
@@ -99,26 +124,51 @@ struct ConcurrentQueue {
 	idx_t GetApproxSize() const;
 	idx_t GetProducerCount() const;
 	idx_t GetTaskCountForProducer(ProducerToken &token) const;
-	concurrent_queue_t &GetQueue() {
-		return q;
+	//! Approx number of tasks queued in a given band across all producers (dispatcher heuristic/instrumentation)
+	idx_t GetBandTaskCount(idx_t band) const;
+	//! Approx number of tasks a single producer currently has queued at a specific band
+	idx_t GetProducerTaskCountAtBand(ProducerToken &token, idx_t band) const;
+	//! Number of demotions observed (a producer's band increased on enqueue)
+	idx_t GetDemotions() const {
+		return demotions;
 	}
 
 private:
-	concurrent_queue_t q;
+	//! Lazily create (caller must hold token.producer_lock) and return the producer's moodycamel token for `band`.
+	QueueProducerToken &GetOrCreateLevelToken(ProducerToken &token, idx_t band);
+
+	concurrent_queue_t q[MLFQ_NUM_BANDS];
 	atomic<idx_t> tasks_in_queue;
+	atomic<idx_t> demotions {0};
 };
 
 struct QueueProducerToken {
-	explicit QueueProducerToken(ConcurrentQueue &queue) : queue_token(queue.GetQueue()) {
+	explicit QueueProducerToken(concurrent_queue_t &level_queue) : queue_token(level_queue) {
 	}
 
 	duckdb_moodycamel::ProducerToken queue_token;
 };
 
+QueueProducerToken &ConcurrentQueue::GetOrCreateLevelToken(ProducerToken &token, idx_t band) {
+	if (!token.level_tokens[band]) {
+		token.level_tokens[band] = make_uniq<QueueProducerToken>(q[band]);
+	}
+	return *token.level_tokens[band];
+}
+
 void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
 	lock_guard<mutex> producer_lock(token.producer_lock);
 	task->token = token;
-	if (q.enqueue(token.token->queue_token, std::move(task))) {
+	idx_t band = 0;
+	if (mlfq_enabled) {
+		band = ComputeBand(token.attained_service_usecs.load());
+		if (band > token.band.load()) {
+			++demotions;
+		}
+	}
+	token.band.store(band);
+	auto &level_token = GetOrCreateLevelToken(token, band);
+	if (q[band].enqueue(level_token.queue_token, std::move(task))) {
 		++tasks_in_queue;
 		semaphore.signal();
 	} else {
@@ -132,7 +182,16 @@ void ConcurrentQueue::EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>>
 	for (auto &task : tasks) {
 		task->token = token;
 	}
-	if (q.enqueue_bulk(token.token->queue_token, std::make_move_iterator(tasks.begin()), tasks.size())) {
+	idx_t band = 0;
+	if (mlfq_enabled) {
+		band = ComputeBand(token.attained_service_usecs.load());
+		if (band > token.band.load()) {
+			++demotions;
+		}
+	}
+	token.band.store(band);
+	auto &level_token = GetOrCreateLevelToken(token, band);
+	if (q[band].enqueue_bulk(level_token.queue_token, std::make_move_iterator(tasks.begin()), tasks.size())) {
 		tasks_in_queue += tasks.size();
 		semaphore.signal(NumericCast<ssize_t>(tasks.size()));
 	} else {
@@ -142,7 +201,11 @@ void ConcurrentQueue::EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>>
 
 bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task> &task) {
 	lock_guard<mutex> producer_lock(token.producer_lock);
-	if (!q.try_dequeue_from_producer(token.token->queue_token, task)) {
+	idx_t band = token.band.load();
+	if (band >= MLFQ_NUM_BANDS || !token.level_tokens[band]) {
+		return false;
+	}
+	if (!q[band].try_dequeue_from_producer(token.level_tokens[band]->queue_token, task)) {
 		return false;
 	}
 	--tasks_in_queue;
@@ -150,26 +213,65 @@ bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task>
 }
 
 bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
-	if (!q.try_dequeue(task)) {
-		return false;
+	if (!mlfq_enabled) {
+		if (!q[0].try_dequeue(task)) {
+			return false;
+		}
+		--tasks_in_queue;
+		return true;
 	}
-	--tasks_in_queue;
-	return true;
+	// absolute priority: always drain higher bands (lower index) before lower ones
+	for (idx_t band = 0; band < MLFQ_NUM_BANDS; band++) {
+		if (q[band].try_dequeue(task)) {
+			--tasks_in_queue;
+			return true;
+		}
+	}
+	return false;
 }
 
 idx_t ConcurrentQueue::GetTasksInQueue() const {
 	return tasks_in_queue;
 }
 idx_t ConcurrentQueue::GetApproxSize() const {
-	return q.size_approx();
+	idx_t total = 0;
+	for (idx_t band = 0; band < MLFQ_NUM_BANDS; band++) {
+		total += q[band].size_approx();
+	}
+	return total;
 }
 idx_t ConcurrentQueue::GetProducerCount() const {
-	return q.size_producers_approx();
+	idx_t total = 0;
+	for (idx_t band = 0; band < MLFQ_NUM_BANDS; band++) {
+		total += q[band].size_producers_approx();
+	}
+	return total;
 }
 
 idx_t ConcurrentQueue::GetTaskCountForProducer(ProducerToken &token) const {
 	lock_guard<mutex> producer_lock(token.producer_lock);
-	return q.size_producer_approx(token.token->queue_token);
+	idx_t total = 0;
+	for (idx_t band = 0; band < MLFQ_NUM_BANDS; band++) {
+		if (token.level_tokens[band]) {
+			total += q[band].size_producer_approx(token.level_tokens[band]->queue_token);
+		}
+	}
+	return total;
+}
+
+idx_t ConcurrentQueue::GetBandTaskCount(idx_t band) const {
+	if (band >= MLFQ_NUM_BANDS) {
+		return 0;
+	}
+	return q[band].size_approx();
+}
+
+idx_t ConcurrentQueue::GetProducerTaskCountAtBand(ProducerToken &token, idx_t band) const {
+	lock_guard<mutex> producer_lock(token.producer_lock);
+	if (band >= MLFQ_NUM_BANDS || !token.level_tokens[band]) {
+		return 0;
+	}
+	return q[band].size_producer_approx(token.level_tokens[band]->queue_token);
 }
 
 #else
@@ -187,25 +289,48 @@ struct ConcurrentQueue {
 	idx_t GetTaskCountForProducer(ProducerToken &token) const;
 };
 
+struct QueueProducerToken {
+	explicit QueueProducerToken(ConcurrentQueue &queue) : queue(&queue) {
+	}
+
+	~QueueProducerToken() {
+		lock_guard<mutex> lock(queue->qlock);
+		queue->q.erase(*this);
+	}
+
+private:
+	ConcurrentQueue *queue;
+};
+
+//! In the no-threads build the MLFQ collapses to a single band: only level_tokens[0] is ever used.
+static QueueProducerToken &GetSingleLevelToken(ConcurrentQueue &queue, ProducerToken &token) {
+	if (!token.level_tokens[0]) {
+		token.level_tokens[0] = make_uniq<QueueProducerToken>(queue);
+	}
+	return *token.level_tokens[0];
+}
+
 void ConcurrentQueue::Enqueue(ProducerToken &token, shared_ptr<Task> task) {
 	lock_guard<mutex> lock(qlock);
 	task->token = token;
-	q[std::ref(*token.token)].push(std::move(task));
+	q[std::ref(GetSingleLevelToken(*this, token))].push(std::move(task));
 }
 
 void ConcurrentQueue::EnqueueBulk(ProducerToken &token, vector<shared_ptr<Task>> &tasks) {
 	lock_guard<mutex> lock(qlock);
+	auto &level_token = GetSingleLevelToken(*this, token);
 	for (auto &task : tasks) {
 		task->token = token;
-		q[std::ref(*token.token)].push(std::move(task));
+		q[std::ref(level_token)].push(std::move(task));
 	}
 }
 
 bool ConcurrentQueue::DequeueFromProducer(ProducerToken &token, shared_ptr<Task> &task) {
 	lock_guard<mutex> lock(qlock);
-	D_ASSERT(!q.empty());
-
-	const auto it = q.find(std::ref(*token.token));
+	if (!token.level_tokens[0]) {
+		return false;
+	}
+	const auto it = q.find(std::ref(*token.level_tokens[0]));
 	if (it == q.end() || it->second.empty()) {
 		return false;
 	}
@@ -240,29 +365,19 @@ idx_t ConcurrentQueue::GetProducerCount() const {
 
 idx_t ConcurrentQueue::GetTaskCountForProducer(ProducerToken &token) const {
 	lock_guard<mutex> lock(qlock);
-	const auto it = q.find(std::ref(*token.token));
+	if (!token.level_tokens[0]) {
+		return 0;
+	}
+	const auto it = q.find(std::ref(*token.level_tokens[0]));
 	if (it == q.end()) {
 		return 0;
 	}
 	return it->second.size();
 }
-
-struct QueueProducerToken {
-	explicit QueueProducerToken(ConcurrentQueue &queue) : queue(&queue) {
-	}
-
-	~QueueProducerToken() {
-		lock_guard<mutex> lock(queue->qlock);
-		queue->q.erase(*this);
-	}
-
-private:
-	ConcurrentQueue *queue;
-};
 #endif
 
-ProducerToken::ProducerToken(TaskScheduler &scheduler, unique_ptr<QueueProducerToken> token)
-    : scheduler(scheduler), token(std::move(token)) {
+ProducerToken::ProducerToken(TaskScheduler &scheduler) : scheduler(scheduler) {
+	level_tokens.resize(MLFQ_NUM_BANDS);
 }
 
 ProducerToken::~ProducerToken() {
@@ -285,6 +400,9 @@ TaskScheduler::TaskScheduler(DatabaseInstance &db)
 #ifdef DUCKDB_NO_THREADS
 	// no background workers exist without threads, so affinity scheduling has nothing to manage
 	affinity_enabled = false;
+#else
+	// when affinity is off the queue stays single-band (byte-for-byte upstream behavior); when on it routes by band
+	queue->mlfq_enabled = affinity_enabled;
 #endif
 	dispatcher = make_uniq<DispatcherState>();
 	// The dispatcher runs for the scheduler's lifetime. It coordinates with thread-pool changes purely through
@@ -312,8 +430,8 @@ TaskScheduler &TaskScheduler::GetScheduler(DatabaseInstance &db) {
 }
 
 shared_ptr<ProducerToken> TaskScheduler::CreateProducer() {
-	auto queue_token = make_uniq<QueueProducerToken>(*queue);
-	auto token = make_shared_ptr<ProducerToken>(*this, std::move(queue_token));
+	// per-level moodycamel tokens are created lazily on first enqueue at each band
+	auto token = make_shared_ptr<ProducerToken>(*this);
 	if (affinity_enabled) {
 		{
 			lock_guard<mutex> guard(registry_lock);
@@ -376,42 +494,52 @@ void TaskScheduler::RebalanceAffinity() {
 		}
 	}
 
-	// compute the priority band of each query from its attained CPU service. Bands grow geometrically: a query is
-	// demoted one band each time its service crosses the next (doubling) cumulative threshold. Band 0 is highest.
-	for (auto &q : live) {
-		auto service = q->attained_service_usecs.load();
-		idx_t band = 0;
-		int64_t threshold = mlfq_threshold_usecs;
-		while (band + 1 < mlfq_num_bands && service >= threshold) {
-			band++;
-			threshold += mlfq_threshold_usecs << band; // geometric growth
-		}
-		q->band.store(band);
-	}
-
-	// order by (band asc, arrival asc) -> absolute priority with FIFO tie-break
-	std::sort(live.begin(), live.end(), [](const shared_ptr<ProducerToken> &a, const shared_ptr<ProducerToken> &b) {
-		auto ba = a->band.load();
-		auto bb = b->band.load();
-		if (ba != bb) {
-			return ba < bb;
-		}
-		return a->arrival_seq < b->arrival_seq;
-	});
-
-	// assign up to affinity_k workers to each query in priority order until workers are exhausted; remaining workers
-	// are left unattached (they pull from the global queue).
 	lock_guard<mutex> tguard(thread_lock);
 	const idx_t worker_count = threads.size();
-	vector<weak_ptr<ProducerToken>> assignment(worker_count); // default-constructed == unattached
-	idx_t widx = 0;
+	if (worker_count == 0) {
+		return;
+	}
+
+	// Bands are maintained at enqueue time (ComputeBand); here we only read the cached band. Collect the producers
+	// that currently have queued work in a demoted band (1+) so we can decide whether to rescue them.
+	vector<shared_ptr<ProducerToken>> lower;
 	for (auto &q : live) {
-		if (widx >= worker_count) {
-			break;
+		idx_t band = q->band.load();
+		if (band == 0) {
+			continue;
 		}
-		for (idx_t i = 0; i < affinity_k && widx < worker_count; i++, widx++) {
-			assignment[widx] = weak_ptr<ProducerToken>(q);
+		if (queue->GetProducerTaskCountAtBand(*q, band) > 0) {
+			lower.push_back(q);
 		}
+	}
+
+	// Situational affinity: top-down scanning already work-conserves, so only divert workers when band 0 cannot keep
+	// the pool busy AND several demoted queries have accumulated. Otherwise leave everyone unattached (the cheap path)
+	// so the dispatcher imposes essentially no overhead in the common case.
+	const idx_t band0_tasks = queue->GetBandTaskCount(0);
+	const bool trigger = (band0_tasks < worker_count) && (lower.size() >= 2);
+
+	vector<weak_ptr<ProducerToken>> assignment(worker_count); // default-constructed == unattached
+	if (trigger) {
+		// rescue the most-deprioritized queries first (highest band), FIFO within a band
+		std::sort(lower.begin(), lower.end(),
+		          [](const shared_ptr<ProducerToken> &a, const shared_ptr<ProducerToken> &b) {
+			          auto ba = a->band.load();
+			          auto bb = b->band.load();
+			          if (ba != bb) {
+				          return ba > bb;
+			          }
+			          return a->arrival_seq < b->arrival_seq;
+		          });
+		// divert at most ~25% of workers and pin them to the trailing slots, so the leading workers keep prioritizing
+		// band 0. Each diverted worker is pinned to a distinct deprioritized producer (round-robin) to spread service
+		// across many starved queries and avoid cross-producer dequeue contention on a single lower-band sub-queue.
+		const idx_t divert = MaxValue<idx_t>(worker_count / 4, 1);
+		for (idx_t i = 0; i < divert; i++) {
+			idx_t slot_idx = worker_count - 1 - i;
+			assignment[slot_idx] = weak_ptr<ProducerToken>(lower[i % lower.size()]);
+		}
+		stat_diversions++;
 	}
 
 	for (idx_t i = 0; i < worker_count; i++) {
@@ -428,10 +556,13 @@ void TaskScheduler::RebalanceAffinity() {
 
 	if (affinity_debug) {
 		Printer::Print(StringUtil::Format(
-		    "[affinity] rebalance: queries=%llu workers=%llu wakeups=%llu reassignments=%llu hits=%llu misses=%llu",
-		    (unsigned long long)live.size(), (unsigned long long)worker_count,
-		    (unsigned long long)stat_dispatcher_wakeups.load(), (unsigned long long)stat_reassignments.load(),
-		    (unsigned long long)stat_attached_hits.load(), (unsigned long long)stat_attached_misses.load()));
+		    "[affinity] rebalance: queries=%llu workers=%llu band0_tasks=%llu lower=%llu trigger=%d wakeups=%llu "
+		    "diversions=%llu reassignments=%llu demotions=%llu hits=%llu misses=%llu",
+		    (unsigned long long)live.size(), (unsigned long long)worker_count, (unsigned long long)band0_tasks,
+		    (unsigned long long)lower.size(), (int)trigger, (unsigned long long)stat_dispatcher_wakeups.load(),
+		    (unsigned long long)stat_diversions.load(), (unsigned long long)stat_reassignments.load(),
+		    (unsigned long long)queue->GetDemotions(), (unsigned long long)stat_attached_hits.load(),
+		    (unsigned long long)stat_attached_misses.load()));
 	}
 #endif
 }

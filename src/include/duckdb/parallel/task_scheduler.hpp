@@ -32,11 +32,13 @@ struct SchedulerThread;
 //! priority band the dispatcher last assigned to it. Tokens are reference counted (shared_ptr) so the dispatcher and
 //! worker mailboxes can safely hold weak_ptrs and lock() them for the duration of an affinity dequeue.
 struct ProducerToken {
-	ProducerToken(TaskScheduler &scheduler, unique_ptr<QueueProducerToken> token);
+	explicit ProducerToken(TaskScheduler &scheduler);
 	~ProducerToken();
 
 	TaskScheduler &scheduler;
-	unique_ptr<QueueProducerToken> token;
+	//! One moodycamel producer token per MLFQ band, created lazily on first enqueue at that band. In the
+	//! DUCKDB_NO_THREADS build only index 0 is used.
+	vector<unique_ptr<QueueProducerToken>> level_tokens;
 	mutex producer_lock;
 
 	//! QCB: total CPU service (in microseconds) attained by tasks of this query
@@ -174,6 +176,8 @@ private:
 	atomic<idx_t> stat_reassignments {0};
 	atomic<idx_t> stat_attached_hits {0};
 	atomic<idx_t> stat_attached_misses {0};
+	//! Number of times the dispatcher diverted workers to rescue crowded lower bands
+	atomic<idx_t> stat_diversions {0};
 
 	friend struct ProducerToken;
 };

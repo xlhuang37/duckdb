@@ -60,6 +60,7 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 		}
 	}
 
+	FlushCpuTime();
 	event->FinishTask();
 	pipeline_executor.reset();
 	return TaskExecutionResult::TASK_FINISHED;

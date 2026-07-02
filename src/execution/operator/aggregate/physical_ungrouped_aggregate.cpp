@@ -516,6 +516,7 @@ TaskExecutionResult UngroupedDistinctAggregateFinalizeTask::ExecuteTask(TaskExec
 	if (res == TaskExecutionResult::TASK_BLOCKED) {
 		return res;
 	}
+	FlushCpuTime();
 	event->FinishTask();
 	return TaskExecutionResult::TASK_FINISHED;
 }

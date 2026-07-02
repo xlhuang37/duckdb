@@ -34,6 +34,7 @@ public:
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
 		async_task->Execute();
 		if (counter->IterateAndCheckCounter()) {
+			FlushCpuTime();
 			interrupt_state.Callback();
 		}
 		return TaskExecutionResult::TASK_FINISHED;

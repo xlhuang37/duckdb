@@ -2,9 +2,45 @@
 #include "duckdb/parallel/task_notifier.hpp"
 #include "duckdb/execution/executor.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 
+#include <chrono>
+#include <ctime>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
 namespace duckdb {
+
+//! Returns the CPU time (in microseconds) consumed by the calling thread so far.
+static int64_t GetThreadCpuTimeUsecs() {
+#if defined(_WIN32)
+	FILETIME creation_time, exit_time, kernel_time, user_time;
+	if (GetThreadTimes(GetCurrentThread(), &creation_time, &exit_time, &kernel_time, &user_time)) {
+		ULARGE_INTEGER kt, ut;
+		kt.LowPart = kernel_time.dwLowDateTime;
+		kt.HighPart = kernel_time.dwHighDateTime;
+		ut.LowPart = user_time.dwLowDateTime;
+		ut.HighPart = user_time.dwHighDateTime;
+		// FILETIME is expressed in 100-nanosecond units
+		return static_cast<int64_t>((kt.QuadPart + ut.QuadPart) / 10);
+	}
+	return 0;
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+	struct timespec ts;
+	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
+		return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
+	}
+	return 0;
+#else
+	// no per-thread CPU clock available - fall back to wall-clock time
+	return std::chrono::duration_cast<std::chrono::microseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+#endif
+}
 
 ExecutorTask::ExecutorTask(Executor &executor_p, shared_ptr<Event> event_p)
     : executor(executor_p), event(std::move(event_p)), context(executor_p.context) {
@@ -34,7 +70,23 @@ void ExecutorTask::Reschedule() {
 	executor.RescheduleTask(this_ptr);
 }
 
+void ExecutorTask::StartCpuTimer() {
+	cpu_time_start = GetThreadCpuTimeUsecs();
+}
+
+void ExecutorTask::FlushCpuTime() {
+	if (cpu_time_start == 0) {
+		return;
+	}
+	const auto now = GetThreadCpuTimeUsecs();
+	if (token) {
+		token->AddCpuTime(now - cpu_time_start);
+	}
+	cpu_time_start = now;
+}
+
 TaskExecutionResult ExecutorTask::Execute(TaskExecutionMode mode) {
+	StartCpuTimer();
 	try {
 		if (thread_context) {
 			TaskExecutionResult result;
@@ -46,15 +98,19 @@ TaskExecutionResult ExecutorTask::Execute(TaskExecutionMode mode) {
 				thread_context->profiler.EndOperator(nullptr);
 				executor.Flush(*thread_context);
 			} while (mode == TaskExecutionMode::PROCESS_ALL && result == TaskExecutionResult::TASK_NOT_FINISHED);
+			FlushCpuTime();
 			return result;
 		} else {
 			TaskNotifier task_notifier {context};
 			auto result = ExecuteTask(mode);
+			FlushCpuTime();
 			return result;
 		}
 	} catch (std::exception &ex) {
+		FlushCpuTime();
 		executor.PushError(ErrorData(ex));
 	} catch (...) { // LCOV_EXCL_START
+		FlushCpuTime();
 		executor.PushError(ErrorData("Unknown exception in ExecutorTask::Execute"));
 	} // LCOV_EXCL_STOP
 	return TaskExecutionResult::TASK_ERROR;

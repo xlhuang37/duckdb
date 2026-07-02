@@ -19,6 +19,7 @@ public:
 public:
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
 		pipeline.ResetSink();
+		FlushCpuTime();
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}

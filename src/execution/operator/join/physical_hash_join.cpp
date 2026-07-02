@@ -474,6 +474,7 @@ public:
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
 		sink.hash_table->InitializePointerTable(entry_idx_from, entry_idx_to);
+		FlushCpuTime();
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
@@ -534,6 +535,7 @@ public:
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
 		sink.hash_table->Finalize(chunk_idx_from, chunk_idx_to, parallel);
+		FlushCpuTime();
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}
@@ -622,6 +624,7 @@ public:
 
 	TaskExecutionResult ExecuteTask(TaskExecutionMode mode) override {
 		local_ht.Repartition(global_ht);
+		FlushCpuTime();
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}

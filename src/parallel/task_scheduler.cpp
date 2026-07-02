@@ -12,7 +12,6 @@
 #include "duckdb/common/thread.hpp"
 #include "lightweightsemaphore.h"
 
-#include <ctime>
 #include <thread>
 #else
 #include <queue>
@@ -298,37 +297,6 @@ idx_t SchedulerQueryNode::ComputeLevel() const {
 	return level;
 }
 
-#ifndef DUCKDB_NO_THREADS
-//! Returns the CPU time (in microseconds) consumed by the calling thread so far. Used to attribute CPU time to
-//! the query that owns the currently executing task. Falls back to wall-clock time if no thread CPU clock exists.
-static int64_t GetThreadCpuTimeUsecs() {
-#if defined(_WIN32)
-	FILETIME creation_time, exit_time, kernel_time, user_time;
-	if (GetThreadTimes(GetCurrentThread(), &creation_time, &exit_time, &kernel_time, &user_time)) {
-		ULARGE_INTEGER kt, ut;
-		kt.LowPart = kernel_time.dwLowDateTime;
-		kt.HighPart = kernel_time.dwHighDateTime;
-		ut.LowPart = user_time.dwLowDateTime;
-		ut.HighPart = user_time.dwHighDateTime;
-		// FILETIME is expressed in 100-nanosecond units
-		return NumericCast<int64_t>((kt.QuadPart + ut.QuadPart) / 10);
-	}
-	return 0;
-#elif defined(CLOCK_THREAD_CPUTIME_ID)
-	struct timespec ts;
-	if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0) {
-		return static_cast<int64_t>(ts.tv_sec) * 1000000 + ts.tv_nsec / 1000;
-	}
-	return 0;
-#else
-	// no per-thread CPU clock available - fall back to wall-clock time
-	return std::chrono::duration_cast<std::chrono::microseconds>(
-	           std::chrono::steady_clock::now().time_since_epoch())
-	    .count();
-#endif
-}
-#endif
-
 TaskScheduler::TaskScheduler(DatabaseInstance &db)
     : db(db), queue(make_uniq<ConcurrentQueue>()),
       allocator_flush_threshold(db.config.options.allocator_flush_threshold),
@@ -415,13 +383,7 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 			if (Settings::Get<SchedulerProcessPartialSetting>(config)) {
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
 			}
-			const auto cpu_start = GetThreadCpuTimeUsecs();
 			auto execute_result = task->Execute(process_mode);
-			// attribute the CPU time spent executing the task to the owning query so that future tasks of
-			// this query can be demoted to a lower-priority level. Must happen before a potential reschedule.
-			if (task->token) {
-				task->token->AddCpuTime(GetThreadCpuTimeUsecs() - cpu_start);
-			}
 
 			switch (execute_result) {
 			case TaskExecutionResult::TASK_FINISHED:
@@ -463,11 +425,7 @@ idx_t TaskScheduler::ExecuteTasks(atomic<bool> *marker, idx_t max_tasks) {
 		if (!queue->Dequeue(task)) {
 			return completed_tasks;
 		}
-		const auto cpu_start = GetThreadCpuTimeUsecs();
 		auto execute_result = task->Execute(TaskExecutionMode::PROCESS_ALL);
-		if (task->token) {
-			task->token->AddCpuTime(GetThreadCpuTimeUsecs() - cpu_start);
-		}
 
 		switch (execute_result) {
 		case TaskExecutionResult::TASK_FINISHED:
@@ -498,11 +456,7 @@ void TaskScheduler::ExecuteTasks(idx_t max_tasks) {
 			return;
 		}
 		try {
-			const auto cpu_start = GetThreadCpuTimeUsecs();
 			auto execute_result = task->Execute(TaskExecutionMode::PROCESS_ALL);
-			if (task->token) {
-				task->token->AddCpuTime(GetThreadCpuTimeUsecs() - cpu_start);
-			}
 			switch (execute_result) {
 			case TaskExecutionResult::TASK_FINISHED:
 			case TaskExecutionResult::TASK_ERROR:

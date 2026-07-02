@@ -56,6 +56,7 @@ public:
 		}
 
 		sink->sink_state->state = sink_state;
+		FlushCpuTime();
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}

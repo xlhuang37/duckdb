@@ -36,6 +36,11 @@ public:
 
 private:
 	ClientContext &context;
+	int64_t cpu_time_start = 0;
+
+protected:
+	void StartCpuTimer();
+	void FlushCpuTime();
 
 public:
 	virtual TaskExecutionResult ExecuteTask(TaskExecutionMode mode) = 0;

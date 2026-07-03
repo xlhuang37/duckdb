@@ -42,7 +42,7 @@ static constexpr idx_t NUM_PRIORITY_LEVELS = 3;
 //! Cumulative CPU-time thresholds (in microseconds) at which a query is demoted to the next lower level.
 //! A query at level i is demoted to level i+1 once its accumulated CPU time reaches DEMOTION_QUANTUM_USECS[i].
 //! The last level never demotes further (value -1 is a sentinel meaning "no further demotion").
-static constexpr int64_t DEMOTION_QUANTUM_USECS[NUM_PRIORITY_LEVELS] = {50000, 500000, -1};
+static constexpr int64_t DEMOTION_QUANTUM_USECS[NUM_PRIORITY_LEVELS] = {5000000, 30000000, -1};
 
 #ifndef DUCKDB_NO_THREADS
 typedef duckdb_moodycamel::ConcurrentQueue<shared_ptr<Task>> concurrent_queue_t;

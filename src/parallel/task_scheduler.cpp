@@ -125,7 +125,6 @@ bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
 	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
 		if (q[level].try_dequeue(task)) {
 			--tasks_in_queue;
-			dequeued_level = level;
 			return true;
 		}
 	}

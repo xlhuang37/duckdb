@@ -43,7 +43,7 @@ public:
 	void CompleteDependency();
 
 	//! Schedule the given tasks for this event. If `sequential` is true, the tasks are given absolute priority
-	//! over all other (parallel) tasks by enqueuing them into the dedicated sequential queue.
+	//! over all other (parallel) tasks by enqueuing them into the dedicated sequential level.
 	void SetTasks(vector<shared_ptr<Task>> tasks, bool sequential = false);
 
 	void InsertEvent(shared_ptr<Event> replacement_event);

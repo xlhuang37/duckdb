@@ -43,8 +43,7 @@ void TaskExecutor::WorkOnTasks() {
 	shared_ptr<Task> task_from_producer;
 	// wait for all active tasks to finish
 	while (completed_tasks != total_tasks) {
-		// only fetch this executor's own tasks - never steal sequential pipeline tasks from other queries
-		if (scheduler.GetTaskFromProducer(*token, task_from_producer, false)) {
+		if (scheduler.GetTaskFromProducer(*token, task_from_producer)) {
 			const auto res = task_from_producer->Execute(TaskExecutionMode::PROCESS_ALL);
 			std::ignore = res;
 			D_ASSERT(res != TaskExecutionResult::TASK_BLOCKED);
@@ -62,8 +61,7 @@ void TaskExecutor::WorkOnTasks() {
 }
 
 bool TaskExecutor::GetTask(shared_ptr<Task> &task) {
-	// only fetch this executor's own tasks - never steal sequential pipeline tasks from other queries
-	return scheduler.GetTaskFromProducer(*token, task, false);
+	return scheduler.GetTaskFromProducer(*token, task);
 }
 
 BaseExecutorTask::BaseExecutorTask(TaskExecutor &executor) : executor(executor) {

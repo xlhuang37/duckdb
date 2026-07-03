@@ -37,26 +37,36 @@ struct SchedulerThread {
 #endif
 };
 
-//! Number of priority levels in the multi-level priority queue (index 0 = highest priority)
+//! Number of CPU-time-based priority levels in the multi-level priority queue.
 static constexpr idx_t NUM_PRIORITY_LEVELS = 3;
-//! Cumulative CPU-time thresholds (in microseconds) at which a query is demoted to the next lower level.
-//! A query at level i is demoted to level i+1 once its accumulated CPU time reaches DEMOTION_QUANTUM_USECS[i].
+//! Cumulative CPU-time thresholds (in microseconds) at which a query is demoted to the next lower CPU-time level.
+//! A query at CPU-time level i is demoted to level i+1 once its accumulated CPU time reaches DEMOTION_QUANTUM_USECS[i].
 //! The last level never demotes further (value -1 is a sentinel meaning "no further demotion").
 static constexpr int64_t DEMOTION_QUANTUM_USECS[NUM_PRIORITY_LEVELS] = {5000000, 30000000, -1};
+
+//! The queue has one dedicated, highest-priority level for sequential tasks (index 0), followed by the
+//! NUM_PRIORITY_LEVELS CPU-time-based levels. The sequential level is a normal level (each query owns its own
+//! producer token for it, just like every other level); it is simply drained before any CPU-time level, giving
+//! sequential tasks absolute priority. It is never a demotion target.
+static constexpr idx_t SEQUENTIAL_LEVEL = 0;
+//! The CPU-time levels occupy indices [FIRST_CPU_LEVEL, FIRST_CPU_LEVEL + NUM_PRIORITY_LEVELS).
+static constexpr idx_t FIRST_CPU_LEVEL = 1;
+//! Total number of levels in the queue (sequential level + CPU-time levels).
+static constexpr idx_t NUM_QUEUE_LEVELS = NUM_PRIORITY_LEVELS + 1;
 
 #ifndef DUCKDB_NO_THREADS
 typedef duckdb_moodycamel::ConcurrentQueue<shared_ptr<Task>> concurrent_queue_t;
 typedef duckdb_moodycamel::LightweightSemaphore lightweight_semaphore_t;
 
 struct ConcurrentQueue {
-	ConcurrentQueue() : sequential_token(sequential_q), tasks_in_queue(0) {
+	ConcurrentQueue() : tasks_in_queue(0) {
 	}
 
 	lightweight_semaphore_t semaphore;
 
 	void Enqueue(SchedulerQueryNode &node, shared_ptr<Task> task);
 	void EnqueueBulk(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks, bool sequential);
-	bool DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task, bool include_sequential);
+	bool DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task);
 	bool Dequeue(shared_ptr<Task> &task);
 	idx_t GetTasksInQueue() const;
 	idx_t GetApproxSize() const;
@@ -67,19 +77,7 @@ struct ConcurrentQueue {
 	}
 
 private:
-	//! Enqueue a single sequential task into the dedicated highest-priority queue
-	void EnqueueSequential(SchedulerQueryNode &node, shared_ptr<Task> task);
-	//! Enqueue a batch of sequential tasks into the dedicated highest-priority queue
-	void EnqueueBulkSequential(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks);
-
-private:
-	concurrent_queue_t q[NUM_PRIORITY_LEVELS];
-	//! Dedicated highest-priority queue for sequential tasks. All sequential tasks (regardless of which query they
-	//! belong to) share a single producer token, so there is exactly one SPMC sub-queue for them. Sequential
-	//! scheduling is rare, so the contention on the shared token / lock is negligible.
-	concurrent_queue_t sequential_q;
-	duckdb_moodycamel::ProducerToken sequential_token;
-	mutex sequential_lock;
+	concurrent_queue_t q[NUM_QUEUE_LEVELS];
 	atomic<idx_t> tasks_in_queue;
 };
 
@@ -91,11 +89,7 @@ struct QueueProducerToken {
 };
 
 void ConcurrentQueue::Enqueue(SchedulerQueryNode &node, shared_ptr<Task> task) {
-	if (task->sequential) {
-		EnqueueSequential(node, std::move(task));
-		return;
-	}
-	const auto level = node.ComputeLevel();
+	const auto level = task->sequential ? SEQUENTIAL_LEVEL : node.ComputeLevel();
 	auto &producer = *node.tokens[level];
 	lock_guard<mutex> producer_lock(producer.producer_lock);
 	task->token = node;
@@ -107,29 +101,14 @@ void ConcurrentQueue::Enqueue(SchedulerQueryNode &node, shared_ptr<Task> task) {
 	}
 }
 
-void ConcurrentQueue::EnqueueSequential(SchedulerQueryNode &node, shared_ptr<Task> task) {
-	lock_guard<mutex> seq_lock(sequential_lock);
-	task->token = node;
-	task->sequential = true;
-	if (sequential_q.enqueue(sequential_token, std::move(task))) {
-		++tasks_in_queue;
-		semaphore.signal();
-	} else {
-		throw InternalException("Could not schedule sequential task!");
-	}
-}
-
 void ConcurrentQueue::EnqueueBulk(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks, bool sequential) {
-	if (sequential) {
-		EnqueueBulkSequential(node, tasks);
-		return;
-	}
 	typedef std::make_signed<std::size_t>::type ssize_t;
-	const auto level = node.ComputeLevel();
+	const auto level = sequential ? SEQUENTIAL_LEVEL : node.ComputeLevel();
 	auto &producer = *node.tokens[level];
 	lock_guard<mutex> producer_lock(producer.producer_lock);
 	for (auto &task : tasks) {
 		task->token = node;
+		task->sequential = sequential;
 	}
 	if (q[level].enqueue_bulk(producer.token->queue_token, std::make_move_iterator(tasks.begin()), tasks.size())) {
 		tasks_in_queue += tasks.size();
@@ -139,32 +118,10 @@ void ConcurrentQueue::EnqueueBulk(SchedulerQueryNode &node, vector<shared_ptr<Ta
 	}
 }
 
-void ConcurrentQueue::EnqueueBulkSequential(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks) {
-	typedef std::make_signed<std::size_t>::type ssize_t;
-	lock_guard<mutex> seq_lock(sequential_lock);
-	for (auto &task : tasks) {
-		task->token = node;
-		task->sequential = true;
-	}
-	if (sequential_q.enqueue_bulk(sequential_token, std::make_move_iterator(tasks.begin()), tasks.size())) {
-		tasks_in_queue += tasks.size();
-		semaphore.signal(NumericCast<ssize_t>(tasks.size()));
-	} else {
-		throw InternalException("Could not schedule sequential tasks!");
-	}
-}
-
-bool ConcurrentQueue::DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task, bool include_sequential) {
-	// sequential tasks have absolute priority over all other tasks
-	if (include_sequential) {
-		lock_guard<mutex> seq_lock(sequential_lock);
-		if (sequential_q.try_dequeue_from_producer(sequential_token, task)) {
-			--tasks_in_queue;
-			return true;
-		}
-	}
+bool ConcurrentQueue::DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task) {
 	// iterate the levels from highest to lowest priority using the matching producer token
-	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
+	// (index 0 is the sequential level, which is drained first)
+	for (idx_t level = 0; level < NUM_QUEUE_LEVELS; level++) {
 		auto &producer = *node.tokens[level];
 		lock_guard<mutex> producer_lock(producer.producer_lock);
 		if (q[level].try_dequeue_from_producer(producer.token->queue_token, task)) {
@@ -176,16 +133,8 @@ bool ConcurrentQueue::DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<T
 }
 
 bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
-	// sequential tasks have absolute priority over all other tasks
-	{
-		lock_guard<mutex> seq_lock(sequential_lock);
-		if (sequential_q.try_dequeue_from_producer(sequential_token, task)) {
-			--tasks_in_queue;
-			return true;
-		}
-	}
-	// iterate the levels from highest to lowest priority
-	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
+	// iterate the levels from highest to lowest priority (index 0 is the sequential level, which is drained first)
+	for (idx_t level = 0; level < NUM_QUEUE_LEVELS; level++) {
 		if (q[level].try_dequeue(task)) {
 			--tasks_in_queue;
 			return true;
@@ -198,15 +147,15 @@ idx_t ConcurrentQueue::GetTasksInQueue() const {
 	return tasks_in_queue;
 }
 idx_t ConcurrentQueue::GetApproxSize() const {
-	idx_t size = sequential_q.size_approx();
-	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
+	idx_t size = 0;
+	for (idx_t level = 0; level < NUM_QUEUE_LEVELS; level++) {
 		size += q[level].size_approx();
 	}
 	return size;
 }
 idx_t ConcurrentQueue::GetProducerCount() const {
-	idx_t count = sequential_q.size_producers_approx();
-	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
+	idx_t count = 0;
+	for (idx_t level = 0; level < NUM_QUEUE_LEVELS; level++) {
 		count += q[level].size_producers_approx();
 	}
 	return count;
@@ -214,7 +163,7 @@ idx_t ConcurrentQueue::GetProducerCount() const {
 
 idx_t ConcurrentQueue::GetTaskCountForProducer(SchedulerQueryNode &node) const {
 	idx_t count = 0;
-	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
+	for (idx_t level = 0; level < NUM_QUEUE_LEVELS; level++) {
 		auto &producer = *node.tokens[level];
 		lock_guard<mutex> producer_lock(producer.producer_lock);
 		count += q[level].size_producer_approx(producer.token->queue_token);
@@ -224,14 +173,12 @@ idx_t ConcurrentQueue::GetTaskCountForProducer(SchedulerQueryNode &node) const {
 
 #else
 struct ConcurrentQueue {
-	reference_map_t<QueueProducerToken, std::queue<shared_ptr<Task>>> q[NUM_PRIORITY_LEVELS];
-	//! Dedicated highest-priority queue for sequential tasks, shared by all queries (single "producer")
-	std::queue<shared_ptr<Task>> sequential_q;
+	reference_map_t<QueueProducerToken, std::queue<shared_ptr<Task>>> q[NUM_QUEUE_LEVELS];
 	mutable mutex qlock;
 
 	void Enqueue(SchedulerQueryNode &node, shared_ptr<Task> task);
 	void EnqueueBulk(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks, bool sequential);
-	bool DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task, bool include_sequential);
+	bool DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task);
 	bool Dequeue(shared_ptr<Task> &task);
 	idx_t GetTasksInQueue() const;
 	idx_t GetApproxSize() const;
@@ -241,12 +188,7 @@ struct ConcurrentQueue {
 
 void ConcurrentQueue::Enqueue(SchedulerQueryNode &node, shared_ptr<Task> task) {
 	lock_guard<mutex> lock(qlock);
-	if (task->sequential) {
-		task->token = node;
-		sequential_q.push(std::move(task));
-		return;
-	}
-	const auto level = node.ComputeLevel();
+	const auto level = task->sequential ? SEQUENTIAL_LEVEL : node.ComputeLevel();
 	auto &producer = *node.tokens[level];
 	task->token = node;
 	q[level][std::ref(*producer.token)].push(std::move(task));
@@ -254,27 +196,20 @@ void ConcurrentQueue::Enqueue(SchedulerQueryNode &node, shared_ptr<Task> task) {
 
 void ConcurrentQueue::EnqueueBulk(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks, bool sequential) {
 	lock_guard<mutex> lock(qlock);
-	if (sequential) {
-		for (auto &task : tasks) {
-			task->token = node;
-			task->sequential = true;
-			sequential_q.push(std::move(task));
-		}
-		return;
-	}
-	const auto level = node.ComputeLevel();
+	const auto level = sequential ? SEQUENTIAL_LEVEL : node.ComputeLevel();
 	auto &producer = *node.tokens[level];
 	for (auto &task : tasks) {
 		task->token = node;
+		task->sequential = sequential;
 		q[level][std::ref(*producer.token)].push(std::move(task));
 	}
 }
 
-bool ConcurrentQueue::DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task, bool include_sequential) {
+bool ConcurrentQueue::DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task) {
 	lock_guard<mutex> lock(qlock);
-=
 	// iterate the levels from highest to lowest priority using the matching producer token
-	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
+	// (index 0 is the sequential level, which is drained first)
+	for (idx_t level = 0; level < NUM_QUEUE_LEVELS; level++) {
 		auto &producer = *node.tokens[level];
 		const auto it = q[level].find(std::ref(*producer.token));
 		if (it == q[level].end() || it->second.empty()) {
@@ -293,8 +228,8 @@ bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
 
 idx_t ConcurrentQueue::GetTasksInQueue() const {
 	lock_guard<mutex> lock(qlock);
-	idx_t task_count = sequential_q.size();
-	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
+	idx_t task_count = 0;
+	for (idx_t level = 0; level < NUM_QUEUE_LEVELS; level++) {
 		for (auto &producer : q[level]) {
 			task_count += producer.second.size();
 		}
@@ -309,7 +244,7 @@ idx_t ConcurrentQueue::GetApproxSize() const {
 idx_t ConcurrentQueue::GetProducerCount() const {
 	lock_guard<mutex> lock(qlock);
 	idx_t count = 0;
-	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
+	for (idx_t level = 0; level < NUM_QUEUE_LEVELS; level++) {
 		count += q[level].size();
 	}
 	return count;
@@ -318,7 +253,7 @@ idx_t ConcurrentQueue::GetProducerCount() const {
 idx_t ConcurrentQueue::GetTaskCountForProducer(SchedulerQueryNode &node) const {
 	lock_guard<mutex> lock(qlock);
 	idx_t count = 0;
-	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
+	for (idx_t level = 0; level < NUM_QUEUE_LEVELS; level++) {
 		auto &producer = *node.tokens[level];
 		const auto it = q[level].find(std::ref(*producer.token));
 		if (it != q[level].end()) {
@@ -365,15 +300,16 @@ void SchedulerQueryNode::AddCpuTime(int64_t usecs) {
 
 idx_t SchedulerQueryNode::ComputeLevel() const {
 	const auto used = cpu_time_used.load();
-	idx_t level = 0;
-	for (; level + 1 < NUM_PRIORITY_LEVELS; level++) {
-		const auto quantum = DEMOTION_QUANTUM_USECS[level];
+	idx_t cpu_level = 0;
+	for (; cpu_level + 1 < NUM_PRIORITY_LEVELS; cpu_level++) {
+		const auto quantum = DEMOTION_QUANTUM_USECS[cpu_level];
 		if (quantum < 0 || used < quantum) {
 			// this level never demotes further, or we have not used enough CPU time to be demoted yet
 			break;
 		}
 	}
-	return level;
+	// the CPU-time levels are offset by the sequential level, which occupies index 0
+	return FIRST_CPU_LEVEL + cpu_level;
 }
 
 TaskScheduler::TaskScheduler(DatabaseInstance &db)
@@ -403,10 +339,10 @@ TaskScheduler &TaskScheduler::GetScheduler(DatabaseInstance &db) {
 }
 
 unique_ptr<SchedulerQueryNode> TaskScheduler::CreateQueryNode() {
-	// create one producer token per priority level, each bound to the matching level's queue
+	// create one producer token per level (including the sequential level), each bound to the matching level's queue
 	vector<unique_ptr<ProducerToken>> tokens;
-	tokens.reserve(NUM_PRIORITY_LEVELS);
-	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
+	tokens.reserve(NUM_QUEUE_LEVELS);
+	for (idx_t level = 0; level < NUM_QUEUE_LEVELS; level++) {
 		auto queue_token = make_uniq<QueueProducerToken>(*queue, level);
 		tokens.push_back(make_uniq<ProducerToken>(*this, std::move(queue_token)));
 	}
@@ -422,8 +358,8 @@ void TaskScheduler::ScheduleTasks(SchedulerQueryNode &node, vector<shared_ptr<Ta
 	queue->EnqueueBulk(node, tasks, sequential);
 }
 
-bool TaskScheduler::GetTaskFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task, bool include_sequential) {
-	return queue->DequeueFromProducer(node, task, include_sequential);
+bool TaskScheduler::GetTaskFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task) {
+	return queue->DequeueFromProducer(node, task);
 }
 
 void TaskScheduler::ExecuteForever(atomic<bool> *marker) {

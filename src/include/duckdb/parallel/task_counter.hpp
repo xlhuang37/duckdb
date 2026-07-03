@@ -30,8 +30,7 @@ public:
 	virtual void Finish() {
 		while (tasks_completed < task_count) {
 			shared_ptr<Task> task;
-			// only fetch this counter's own tasks - never steal sequential pipeline tasks from other queries
-			if (scheduler.GetTaskFromProducer(*token, task, false)) {
+			if (scheduler.GetTaskFromProducer(*token, task)) {
 				task->Execute();
 				task.reset();
 			}

@@ -76,12 +76,12 @@ void Event::InsertEvent(shared_ptr<Event> replacement_event) {
 	executor.AddEvent(std::move(replacement_event));
 }
 
-void Event::SetTasks(vector<shared_ptr<Task>> tasks) {
+void Event::SetTasks(vector<shared_ptr<Task>> tasks, bool sequential) {
 	auto &ts = TaskScheduler::GetScheduler(executor.context);
 	D_ASSERT(total_tasks == 0);
 	D_ASSERT(!tasks.empty());
 	this->total_tasks = tasks.size();
-	ts.ScheduleTasks(executor.GetToken(), tasks);
+	ts.ScheduleTasks(executor.GetToken(), tasks, sequential);
 }
 
 } // namespace duckdb

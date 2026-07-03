@@ -58,6 +58,9 @@ public:
 
 public:
 	optional_ptr<SchedulerQueryNode> token;
+	//! Whether this task is a sequential task. Sequential tasks are enqueued into a dedicated highest-priority
+	//! queue and are executed with absolute priority over all other (parallel) tasks.
+	bool sequential = false;
 };
 
 } // namespace duckdb

@@ -67,9 +67,12 @@ public:
 	unique_ptr<SchedulerQueryNode> CreateQueryNode();
 	//! Schedule a task to be executed by the task scheduler
 	void ScheduleTask(SchedulerQueryNode &node, shared_ptr<Task> task);
-	void ScheduleTasks(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks);
-	//! Fetches a task from a specific query node, returns true if successful or false if no tasks were available
-	bool GetTaskFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task);
+	//! Schedule a batch of tasks. If `sequential` is true, the tasks are enqueued into the dedicated
+	//! highest-priority sequential queue and executed with absolute priority over all other tasks.
+	void ScheduleTasks(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks, bool sequential = false);
+	//! Fetches a task from a specific query node, returns true if successful or false if no tasks were available.
+	//! When `include_sequential` is true, the shared highest-priority sequential queue is consulted first.
+	bool GetTaskFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task, bool include_sequential = true);
 	//! Run tasks forever until "marker" is set to false, "marker" must remain valid until the thread is joined
 	void ExecuteForever(atomic<bool> *marker);
 	//! Run tasks until `marker` is set to false, `max_tasks` have been completed, or until there are no more tasks

@@ -57,7 +57,7 @@ struct ConcurrentQueue {
 	void Enqueue(SchedulerQueryNode &node, shared_ptr<Task> task);
 	void EnqueueBulk(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks);
 	bool DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task);
-	bool Dequeue(shared_ptr<Task> &task);
+	bool Dequeue(shared_ptr<Task> &task, idx_t &dequeued_level);
 	idx_t GetTasksInQueue() const;
 	idx_t GetApproxSize() const;
 	idx_t GetProducerCount() const;
@@ -120,11 +120,12 @@ bool ConcurrentQueue::DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<T
 	return false;
 }
 
-bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
+bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task, idx_t &dequeued_level) {
 	// iterate the levels from highest to lowest priority
 	for (idx_t level = 0; level < NUM_PRIORITY_LEVELS; level++) {
 		if (q[level].try_dequeue(task)) {
 			--tasks_in_queue;
+			dequeued_level = level;
 			return true;
 		}
 	}
@@ -167,7 +168,7 @@ struct ConcurrentQueue {
 	void Enqueue(SchedulerQueryNode &node, shared_ptr<Task> task);
 	void EnqueueBulk(SchedulerQueryNode &node, vector<shared_ptr<Task>> &tasks);
 	bool DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<Task> &task);
-	bool Dequeue(shared_ptr<Task> &task);
+	bool Dequeue(shared_ptr<Task> &task, idx_t &dequeued_level);
 	idx_t GetTasksInQueue() const;
 	idx_t GetApproxSize() const;
 	idx_t GetProducerCount() const;
@@ -208,7 +209,7 @@ bool ConcurrentQueue::DequeueFromProducer(SchedulerQueryNode &node, shared_ptr<T
 	return false;
 }
 
-bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task) {
+bool ConcurrentQueue::Dequeue(shared_ptr<Task> &task, idx_t &dequeued_level) {
 	throw InternalException("Global dequeue not supported for no threads queue");
 }
 
@@ -347,6 +348,22 @@ bool TaskScheduler::GetTaskFromProducer(SchedulerQueryNode &node, shared_ptr<Tas
 	return queue->DequeueFromProducer(node, task);
 }
 
+//! When a task is grabbed from the global queue, its owning query may have accumulated enough CPU time to belong to a
+//! lower-priority level than the one it was enqueued at. In that case we re-enqueue it into its (now correct) level
+//! instead of running it, keeping the multi-level queue consistent with the query's current CPU usage.
+//! Returns true if the task was demoted (and hence must not be executed by the caller).
+//! This is safe because a grabbed task keeps its SchedulerQueryNode alive, so token dereference cannot dangle.
+static bool ReenqueueIfDemoted(ConcurrentQueue &queue, shared_ptr<Task> &task, idx_t dequeued_level) {
+	if (!task->token) {
+		return false;
+	}
+	if (task->token->ComputeLevel() <= dequeued_level) {
+		return false;
+	}
+	queue.Enqueue(*task->token, std::move(task));
+	return true;
+}
+
 void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 #ifndef DUCKDB_NO_THREADS
 	static constexpr const int64_t INITIAL_FLUSH_WAIT = 500000; // initial wait time of 0.5s (in mus) before flushing
@@ -378,7 +395,12 @@ void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 				}
 			}
 		}
-		if (queue->Dequeue(task)) {
+		idx_t dequeued_level;
+		if (queue->Dequeue(task, dequeued_level)) {
+			if (ReenqueueIfDemoted(*queue, task, dequeued_level)) {
+				// the task's query has been demoted since it was enqueued: it was moved to the correct level
+				continue;
+			}
 			auto process_mode = TaskExecutionMode::PROCESS_ALL;
 			if (Settings::Get<SchedulerProcessPartialSetting>(config)) {
 				process_mode = TaskExecutionMode::PROCESS_PARTIAL;
@@ -422,8 +444,13 @@ idx_t TaskScheduler::ExecuteTasks(atomic<bool> *marker, idx_t max_tasks) {
 	// loop until the marker is set to false
 	while (*marker && completed_tasks < max_tasks) {
 		shared_ptr<Task> task;
-		if (!queue->Dequeue(task)) {
+		idx_t dequeued_level;
+		if (!queue->Dequeue(task, dequeued_level)) {
 			return completed_tasks;
+		}
+		if (ReenqueueIfDemoted(*queue, task, dequeued_level)) {
+			// the task's query has been demoted since it was enqueued: it was moved to the correct level
+			continue;
 		}
 		auto execute_result = task->Execute(TaskExecutionMode::PROCESS_ALL);
 
@@ -434,7 +461,9 @@ idx_t TaskScheduler::ExecuteTasks(atomic<bool> *marker, idx_t max_tasks) {
 			completed_tasks++;
 			break;
 		case TaskExecutionResult::TASK_NOT_FINISHED:
-			throw InternalException("Task should not return TASK_NOT_FINISHED in PROCESS_ALL mode");
+			// the time slice expired with work remaining: re-enqueue so it is resumed later
+			queue->Enqueue(*task->token, std::move(task));
+			break;
 		case TaskExecutionResult::TASK_BLOCKED:
 			task->Deschedule();
 			task.reset();
@@ -452,8 +481,13 @@ void TaskScheduler::ExecuteTasks(idx_t max_tasks) {
 	shared_ptr<Task> task;
 	for (idx_t i = 0; i < max_tasks; i++) {
 		queue->semaphore.wait(TASK_TIMEOUT_USECS);
-		if (!queue->Dequeue(task)) {
+		idx_t dequeued_level;
+		if (!queue->Dequeue(task, dequeued_level)) {
 			return;
+		}
+		if (ReenqueueIfDemoted(*queue, task, dequeued_level)) {
+			// the task's query has been demoted since it was enqueued: it was moved to the correct level
+			continue;
 		}
 		try {
 			auto execute_result = task->Execute(TaskExecutionMode::PROCESS_ALL);
@@ -463,7 +497,9 @@ void TaskScheduler::ExecuteTasks(idx_t max_tasks) {
 				task.reset();
 				break;
 			case TaskExecutionResult::TASK_NOT_FINISHED:
-				throw InternalException("Task should not return TASK_NOT_FINISHED in PROCESS_ALL mode");
+				// the time slice expired with work remaining: re-enqueue so it is resumed later
+				queue->Enqueue(*task->token, std::move(task));
+				break;
 			case TaskExecutionResult::TASK_BLOCKED:
 				task->Deschedule();
 				task.reset();

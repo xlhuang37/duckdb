@@ -4,13 +4,7 @@
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parallel/thread_context.hpp"
-
-#include <chrono>
-#include <ctime>
-
-#if defined(_WIN32)
-#include <windows.h>
-#endif
+#include "duckdb/parallel/thread_cpu_time.hpp"
 
 namespace duckdb {
 

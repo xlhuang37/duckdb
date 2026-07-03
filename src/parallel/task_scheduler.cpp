@@ -354,16 +354,19 @@ bool TaskScheduler::GetTaskFromProducer(SchedulerQueryNode &node, shared_ptr<Tas
 //! Returns true if the task was demoted (and hence must not be executed by the caller).
 //! This is safe because a grabbed task keeps its SchedulerQueryNode alive, so token dereference cannot dangle.
 static bool ReenqueueIfDemoted(ConcurrentQueue &queue, shared_ptr<Task> &task, idx_t dequeued_level) {
-	if (!task->token) {
-		return false;
-	}
-	if (task->token->ComputeLevel() <= dequeued_level) {
-		return false;
-	}
-	queue.Enqueue(*task->token, std::move(task));
-	return true;
+    if (!task->token) {
+        return false;
+    }
+    if (task->token->ComputeLevel() <= dequeued_level) {
+        return false;
+    }
+    
+    // Fix: Extract the token reference BEFORE hollowing out the task pointer
+    auto& token = *task->token; 
+    queue.Enqueue(token, std::move(task));
+    
+    return true;
 }
-
 void TaskScheduler::ExecuteForever(atomic<bool> *marker) {
 #ifndef DUCKDB_NO_THREADS
 	static constexpr const int64_t INITIAL_FLUSH_WAIT = 500000; // initial wait time of 0.5s (in mus) before flushing

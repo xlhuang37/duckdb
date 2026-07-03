@@ -31,7 +31,6 @@ void ArrowBatchTask::ProduceRecordBatches() {
 
 TaskExecutionResult ArrowBatchTask::ExecuteTask(TaskExecutionMode mode) {
 	ProduceRecordBatches();
-	FlushCpuTime();
 	event->FinishTask();
 	return TaskExecutionResult::TASK_FINISHED;
 }

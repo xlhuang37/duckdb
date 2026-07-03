@@ -158,7 +158,6 @@ public:
 			table.global_source.reset();
 		}
 
-		FlushCpuTime();
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}

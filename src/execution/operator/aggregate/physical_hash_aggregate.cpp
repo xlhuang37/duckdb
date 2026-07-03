@@ -518,7 +518,6 @@ TaskExecutionResult HashAggregateFinalizeTask::ExecuteTask(TaskExecutionMode mod
 	op.FinalizeInternal(pipeline, *event, context, gstate, false);
 	D_ASSERT(!gstate.finished);
 	gstate.finished = true;
-	FlushCpuTime();
 	event->FinishTask();
 	return TaskExecutionResult::TASK_FINISHED;
 }
@@ -642,7 +641,6 @@ TaskExecutionResult HashAggregateDistinctFinalizeTask::ExecuteTask(TaskExecution
 		next_payload_idx = 0;
 		local_sink_state = nullptr;
 	}
-	FlushCpuTime();
 	event->FinishTask();
 	return TaskExecutionResult::TASK_FINISHED;
 }

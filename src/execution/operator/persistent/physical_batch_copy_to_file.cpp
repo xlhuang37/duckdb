@@ -267,7 +267,6 @@ public:
 		while (op.ExecuteTask(context, gstate)) {
 			op.FlushBatchData(context, gstate);
 		}
-		FlushCpuTime();
 		event->FinishTask();
 		return TaskExecutionResult::TASK_FINISHED;
 	}

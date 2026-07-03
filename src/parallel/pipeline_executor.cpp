@@ -186,18 +186,9 @@ SinkNextBatchType PipelineExecutor::NextBatch(DataChunk &source_chunk, const boo
 }
 
 PipelineExecuteResult PipelineExecutor::Execute(idx_t max_chunks) {
-	ExecutionBudget chunk_budget(max_chunks);
-	return ExecuteInternal(chunk_budget);
-}
-
-PipelineExecuteResult PipelineExecutor::Execute(microseconds time_slice) {
-	ExecutionBudget chunk_budget(time_slice);
-	return ExecuteInternal(chunk_budget);
-}
-
-PipelineExecuteResult PipelineExecutor::ExecuteInternal(ExecutionBudget &chunk_budget) {
 	D_ASSERT(pipeline.sink);
 	auto &source_chunk = pipeline.operators.empty() ? final_chunk : *intermediate_chunks[0];
+	ExecutionBudget chunk_budget(max_chunks);
 	do {
 		if (context.client.interrupted) {
 			throw InterruptException();

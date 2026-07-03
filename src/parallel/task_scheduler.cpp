@@ -461,9 +461,7 @@ idx_t TaskScheduler::ExecuteTasks(atomic<bool> *marker, idx_t max_tasks) {
 			completed_tasks++;
 			break;
 		case TaskExecutionResult::TASK_NOT_FINISHED:
-			// the time slice expired with work remaining: re-enqueue so it is resumed later
-			queue->Enqueue(*task->token, std::move(task));
-			break;
+			throw InternalException("Task should not return TASK_NOT_FINISHED in PROCESS_ALL mode");
 		case TaskExecutionResult::TASK_BLOCKED:
 			task->Deschedule();
 			task.reset();
@@ -497,9 +495,7 @@ void TaskScheduler::ExecuteTasks(idx_t max_tasks) {
 				task.reset();
 				break;
 			case TaskExecutionResult::TASK_NOT_FINISHED:
-				// the time slice expired with work remaining: re-enqueue so it is resumed later
-				queue->Enqueue(*task->token, std::move(task));
-				break;
+				throw InternalException("Task should not return TASK_NOT_FINISHED in PROCESS_ALL mode");
 			case TaskExecutionResult::TASK_BLOCKED:
 				task->Deschedule();
 				task.reset();

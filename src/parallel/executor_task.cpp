@@ -5,13 +5,8 @@
 #include "duckdb/parallel/task_scheduler.hpp"
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/parallel/thread_cpu_time.hpp"
-#include "duckdb/common/chrono.hpp"
 
 namespace duckdb {
-
-//! In PROCESS_ALL mode a task runs for at most this long before yielding with TASK_NOT_FINISHED, so it is rescheduled
-//! and other (possibly higher-priority) tasks get a turn. This bounds how long a single task can monopolize a worker.
-static constexpr int64_t TASK_TIME_SLICE_USECS = 10000; // 10 milliseconds
 
 ExecutorTask::ExecutorTask(Executor &executor_p, shared_ptr<Event> event_p)
     : executor(executor_p), event(std::move(event_p)), context(executor_p.context) {
@@ -58,17 +53,9 @@ void ExecutorTask::FlushCpuTime() {
 
 TaskExecutionResult ExecutorTask::Execute(TaskExecutionMode mode) {
 	StartCpuTimer();
-	// In PROCESS_ALL mode we execute in small (PROCESS_PARTIAL) steps and stop once the task finishes/blocks or the
-	// time slice expires. When the slice expires with work remaining we return TASK_NOT_FINISHED so the scheduler
-	// reschedules the task instead of letting it monopolize the worker.
-	const auto slice_start = steady_clock::now();
-	auto slice_expired = [&]() {
-		const auto elapsed = duration_cast<microseconds>(steady_clock::now() - slice_start).count();
-		return elapsed >= TASK_TIME_SLICE_USECS;
-	};
 	try {
-		TaskExecutionResult result;
 		if (thread_context) {
+			TaskExecutionResult result;
 			do {
 				TaskNotifier task_notifier {context};
 				thread_context->profiler.StartOperator(op);
@@ -76,17 +63,15 @@ TaskExecutionResult ExecutorTask::Execute(TaskExecutionMode mode) {
 				result = ExecuteTask(TaskExecutionMode::PROCESS_PARTIAL);
 				thread_context->profiler.EndOperator(nullptr);
 				executor.Flush(*thread_context);
-			} while (mode == TaskExecutionMode::PROCESS_ALL &&
-			         result == TaskExecutionResult::TASK_NOT_FINISHED && !slice_expired());
+			} while (mode == TaskExecutionMode::PROCESS_ALL && result == TaskExecutionResult::TASK_NOT_FINISHED);
+			FlushCpuTime();
+			return result;
 		} else {
-			do {
-				TaskNotifier task_notifier {context};
-				result = ExecuteTask(TaskExecutionMode::PROCESS_PARTIAL);
-			} while (mode == TaskExecutionMode::PROCESS_ALL &&
-			         result == TaskExecutionResult::TASK_NOT_FINISHED && !slice_expired());
+			TaskNotifier task_notifier {context};
+			auto result = ExecuteTask(mode);
+			FlushCpuTime();
+			return result;
 		}
-		FlushCpuTime();
-		return result;
 	} catch (std::exception &ex) {
 		FlushCpuTime();
 		executor.PushError(ErrorData(ex));

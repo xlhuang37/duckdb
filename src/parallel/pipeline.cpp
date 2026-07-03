@@ -38,7 +38,7 @@ TaskExecutionResult PipelineTask::ExecuteTask(TaskExecutionMode mode) {
 	pipeline_executor->SetTaskForInterrupts(shared_from_this());
 
 	if (mode == TaskExecutionMode::PROCESS_PARTIAL) {
-		auto res = pipeline_executor->Execute(PARTIAL_CHUNK_COUNT);
+		auto res = pipeline_executor->Execute(microseconds(PARTIAL_TIME_SLICE_USECS));
 
 		switch (res) {
 		case PipelineExecuteResult::NOT_FINISHED:

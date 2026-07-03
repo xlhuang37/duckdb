@@ -15,6 +15,7 @@
 #include "duckdb/parallel/thread_context.hpp"
 #include "duckdb/execution/execution_context.hpp"
 #include "duckdb/common/stack.hpp"
+#include "duckdb/common/chrono.hpp"
 
 #include <functional>
 
@@ -32,9 +33,18 @@ enum class PipelineExecuteResult {
 	INTERRUPTED
 };
 
+//! Bounds how much work a single (partial) pipeline execution does before yielding. The budget is either count-based
+//! (process at most N source chunks) or time-based (process source chunks until a time slice has elapsed). In both
+//! cases at least one chunk is always processed, guaranteeing forward progress.
 class ExecutionBudget {
 public:
-	explicit ExecutionBudget(idx_t maximum) : processed(0), maximum_to_process(maximum) {
+	//! Count-based budget: process at most `maximum` chunks
+	explicit ExecutionBudget(idx_t maximum)
+	    : processed(0), maximum_to_process(maximum), time_based(false), deadline() {
+	}
+	//! Time-based budget: process chunks until `slice` has elapsed
+	explicit ExecutionBudget(microseconds slice)
+	    : processed(0), maximum_to_process(0), time_based(true), deadline(steady_clock::now() + slice) {
 	}
 
 public:
@@ -46,12 +56,19 @@ public:
 		return true;
 	}
 	bool IsDepleted() const {
+		if (time_based) {
+			return steady_clock::now() >= deadline;
+		}
 		return processed >= maximum_to_process;
 	}
 
 private:
 	idx_t processed;
 	idx_t maximum_to_process;
+	//! Whether this budget is bounded by elapsed time (true) or by chunk count (false)
+	bool time_based;
+	//! When time_based, the point in time at which the budget is depleted
+	time_point<steady_clock> deadline;
 };
 
 //! The Pipeline class represents an execution pipeline
@@ -64,6 +81,9 @@ public:
 	//! Execute a pipeline with a source and a sink until finished, or until max_chunks were processed from the source
 	//! Returns true if execution is finished, false if Execute should be called again
 	PipelineExecuteResult Execute(idx_t max_chunks);
+	//! Execute a pipeline with a source and a sink until finished, or until the given time slice has elapsed
+	//! Returns true if execution is finished, false if Execute should be called again
+	PipelineExecuteResult Execute(microseconds time_slice);
 
 	//! Called after depleting the source: finalizes the execution of this pipeline executor
 	//! This should only be called once per PipelineExecutor.
@@ -148,6 +168,8 @@ private:
 	SourceResultType GetData(DataChunk &chunk, OperatorSourceInput &input);
 	SinkResultType Sink(DataChunk &chunk, OperatorSinkInput &input);
 
+	//! Shared implementation for the public Execute overloads: processes the pipeline within the given budget
+	PipelineExecuteResult ExecuteInternal(ExecutionBudget &chunk_budget);
 	OperatorResultType ExecutePushInternal(DataChunk &input, ExecutionBudget &chunk_budget, idx_t initial_idx = 0);
 	//! Pushes a chunk through the pipeline and returns a single result chunk
 	//! Returns whether or not a new input chunk is needed, or whether or not we are finished

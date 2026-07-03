@@ -25,7 +25,9 @@ class PipelineExecutor;
 class Pipeline;
 
 class PipelineTask : public ExecutorTask {
-	static constexpr const idx_t PARTIAL_CHUNK_COUNT = 50;
+	//! Time slice for a single partial (PROCESS_PARTIAL) execution: the task processes source chunks for up to this
+	//! long before yielding so it can be rescheduled, giving other tasks a turn.
+	static constexpr const int64_t PARTIAL_TIME_SLICE_USECS = 10000; // 10 milliseconds
 
 public:
 	explicit PipelineTask(Pipeline &pipeline_p, shared_ptr<Event> event_p);

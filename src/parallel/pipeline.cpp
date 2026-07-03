@@ -96,7 +96,9 @@ bool Pipeline::GetProgress(ProgressData &progress) {
 void Pipeline::ScheduleSequentialTask(shared_ptr<Event> &event) {
 	vector<shared_ptr<Task>> tasks;
 	tasks.push_back(make_uniq<PipelineTask>(*this, event));
-	event->SetTasks(std::move(tasks));
+	// a sequential pipeline is a single task: run it directly on the scheduling thread instead of taking a
+	// round-trip through the global scheduler queue
+	event->SetTasksInline(std::move(tasks));
 }
 
 bool Pipeline::ScheduleParallel(shared_ptr<Event> &event) {

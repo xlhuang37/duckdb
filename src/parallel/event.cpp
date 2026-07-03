@@ -84,4 +84,42 @@ void Event::SetTasks(vector<shared_ptr<Task>> tasks) {
 	ts.ScheduleTasks(executor.GetToken(), tasks);
 }
 
+void Event::SetTasksInline(vector<shared_ptr<Task>> tasks) {
+	// Bounds how deeply sequential tasks may be chained inline on a single native stack before we fall back to the
+	// scheduler queue. A chain forms when finishing an inline task triggers a dependent pipeline to be scheduled on
+	// the same thread (FinishTask -> CompleteDependency -> Schedule). Without a bound, a long chain of dependent
+	// sequential pipelines could overflow the stack.
+	static constexpr idx_t MAX_INLINE_DEPTH = 32;
+	static thread_local idx_t inline_depth = 0;
+
+	D_ASSERT(total_tasks == 0);
+	D_ASSERT(!tasks.empty());
+	this->total_tasks = tasks.size();
+
+	auto &node = executor.GetToken();
+	if (inline_depth >= MAX_INLINE_DEPTH) {
+		// too deep: fall back to normal scheduling to keep the native stack bounded
+		auto &ts = TaskScheduler::GetScheduler(executor.context);
+		ts.ScheduleTasks(node, tasks);
+		return;
+	}
+
+	inline_depth++;
+	for (auto &task : tasks) {
+		// attribute CPU time to this query even though we bypass the queue (keeps LAS priority accounting correct)
+		task->token = node;
+		// ExecutorTask::Execute never throws (it converts exceptions into TASK_ERROR), so inline_depth is always
+		// restored below without needing a try/catch here.
+		const auto result = task->Execute(TaskExecutionMode::PROCESS_ALL);
+		if (result == TaskExecutionResult::TASK_BLOCKED) {
+			// the task interrupted (e.g. waiting on async I/O): hand it to the scheduler so a worker thread resumes
+			// it once it is unblocked
+			task->Deschedule();
+		}
+		// TASK_FINISHED / TASK_ERROR: FinishTask() / error propagation already happened inside Execute().
+		// TASK_NOT_FINISHED cannot occur under PROCESS_ALL for pipeline tasks.
+	}
+	inline_depth--;
+}
+
 } // namespace duckdb

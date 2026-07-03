@@ -43,6 +43,11 @@ public:
 	void CompleteDependency();
 
 	void SetTasks(vector<shared_ptr<Task>> tasks);
+	//! Like SetTasks, but instead of handing the tasks to the global scheduler queue, the calling thread executes
+	//! them inline. This is used for sequential (single-task) pipelines: the thread that schedules them has usually
+	//! just finished its previous task, so running the task directly avoids a queue round-trip. If a task blocks it
+	//! is handed off to the scheduler so a worker thread can resume it once it is unblocked.
+	void SetTasksInline(vector<shared_ptr<Task>> tasks);
 
 	void InsertEvent(shared_ptr<Event> replacement_event);
 
